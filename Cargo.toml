@@ -1,0 +1,12 @@
+[package]
+name = "batch_shutdown"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = "0.4"
+dialoguer = "0.10"
+ssh2 = "0.9.6"
+serde = { version = "1.0", features = ["derive"] }
+dirs = "5.0"
+toml = "0.8"

@@ -1,0 +1,15 @@
+# 全局配置（放在最前面 / 所有[[machines]]外面）
+shutdown_delay_sec = 60
+shutdown_command = "shutdown -h +1 \"批量远程关机，一分钟后断电，shutdown -c 可取消\""
+private_key_path = ""
+check_retry_times = 3
+check_interval_ms = 1000
+
+# 机器列表
+[[machines]]
+ip = "192.168.1.101"
+user = "root"
+
+[[machines]]
+ip = "192.168.1.102"
+user = "root"
