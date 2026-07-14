@@ -5,11 +5,53 @@ private_key_path = ""
 check_retry_times = 3
 check_interval_ms = 1000
 
-# 机器列表
+
+# 算力服务
 [[machines]]
-ip = "192.168.1.101"
+ip = "192.168.100.22"
 user = "root"
+name = "算力节点-01"
+tag = "算力服务"
 
 [[machines]]
-ip = "192.168.1.102"
+ip = "192.168.100.119"
 user = "root"
+name = "算力节点-02"
+tag = "算力服务"
+
+[[machines]]
+ip = "192.168.100.67"
+user = "root"
+name = "算力节点-03"
+tag = "算力服务"
+
+[[machines]]
+ip = "192.168.100.31"
+user = "root"
+name = "算力节点-04"
+tag = "算力服务"
+
+[[machines]]
+ip = "192.168.100.51"
+user = "root"
+name = "算力节点-05"
+tag = "算力服务"
+
+# 管理平台
+[[machines]]
+ip = "192.168.100.112"
+user = "root"
+name = "管理节点-01"
+tag = "管理平台"
+
+[[machines]]
+ip = "192.168.100.113"
+user = "root"
+name = "管理节点-02"
+tag = "管理平台"
+
+[[machines]]
+ip = "192.168.100.53"
+user = "root"
+name = "管理节点-03"
+tag = "管理平台"

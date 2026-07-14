@@ -87,7 +87,11 @@ fn ssh_shutdown(m: &Machine, cmd: &str, key_path: &PathBuf, key_passphrase: &str
 
     let mut channel = sess.channel_session()?;
     channel.exec(cmd)?;
-    channel.wait_close()?;
+    // channel.wait_close()?;
+
+    let _ = channel.send_eof();
+    let _ = channel.wait_eof();
+    
     Ok(())
 }
 
