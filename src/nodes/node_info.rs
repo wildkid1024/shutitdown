@@ -183,9 +183,14 @@ fn parse_gpu_cards(raw: &str) -> Vec<GpuInfo> {
         if parts.len() >= 5 {
             let mem_used = parts[2].trim();
             let mem_total = parts[3].trim();
-            let mem_util = if let (Ok(u), Ok(t)) = (mem_used.parse::<f64>(), mem_total.parse::<f64>()) {
+            // NPU 格式（6 字段）：index, model, mem_used, mem_total, mem_util, compute_util
+            // Nvidia 格式（5 字段）：index, model, mem_used, mem_total, compute_util
+            let mem_util = if parts.len() >= 6 {
+                parts[4].to_string()
+            } else if let (Ok(u), Ok(t)) = (mem_used.parse::<f64>(), mem_total.parse::<f64>()) {
                 if t > 0.0 { format!("{:.0}", u / t * 100.0) } else { "0".into() }
             } else { "N/A".into() };
+            let compute_util_idx = if parts.len() >= 6 { 5 } else { 4 };
             let fmt_mem = |v: &str| -> String {
                 if let Ok(mb) = v.parse::<f64>() {
                     if mb >= 1024.0 { format!("{:.1}G", mb / 1024.0) } else { format!("{:.0}M", mb) }
@@ -197,7 +202,7 @@ fn parse_gpu_cards(raw: &str) -> Vec<GpuInfo> {
                 mem_used_mb: fmt_mem(mem_used),
                 mem_total_mb: fmt_mem(mem_total),
                 mem_util_pct: mem_util,
-                compute_util_pct: parts[4].to_string(),
+                compute_util_pct: parts[compute_util_idx].to_string(),
             });
         }
     }
@@ -271,15 +276,19 @@ elif command -v npu-smi &>/dev/null; then \
   if [ "$npu_list" -gt 0 ] 2>/dev/null; then \
     for ((i=0; i<npu_list; i++)); do \
       dev_name=$(npu-smi info -t board -i $i 2>/dev/null | sed -n 's/.*Product Name[[:space:]]*:[[:space:]]*//p' | xargs); \
-      mem_info=$(npu-smi info -t memory -i $i -c 0 2>/dev/null); \
-      mem_used=$(echo "$mem_info" | sed -n 's/.*Used[[:space:]]*:[[:space:]]*//p' | awk '{print $1}'); \
-      mem_total=$(echo "$mem_info" | sed -n 's/.*Total[[:space:]]*:[[:space:]]*//p' | awk '{print $1}'); \
-      compute_util=$(npu-smi info -t usages -i $i 2>/dev/null | sed -n 's/.*ai_core[[:space:]]*(%):[[:space:]]*//p' | xargs); \
-      echo "$i, Ascend $dev_name, ${mem_used:-0}, ${mem_total:-0}, ${compute_util:-0}"; \
+      usage_info=$(npu-smi info -t usages -i $i 2>/dev/null); \
+      hbm_cap=$(echo "$usage_info" | grep 'HBM Capacity' | awk -F':[[:space:]]*' '{print $2}' | awk '{print $1}' | xargs); \
+      hbm_pct=$(echo "$usage_info" | grep 'HBM Usage Rate' | grep -v Bandwidth | awk -F':[[:space:]]*' '{print $2}' | sed 's/%//' | xargs); \
+      compute_util=$(echo "$usage_info" | grep 'Aicore Usage Rate' | awk -F':[[:space:]]*' '{print $2}' | xargs); \
+      if [ -n "$hbm_cap" ] && [ -n "$hbm_pct" ]; then mem_used_mb=$((hbm_cap * hbm_pct / 100)); else mem_used_mb=0; fi; \
+      echo "$i, Ascend $dev_name, ${mem_used_mb:-0}, ${hbm_cap:-0}, ${hbm_pct:-0}, ${compute_util:-0}"; \
     done; \
   else echo 'N/A'; fi; \
 elif command -v rocm-smi &>/dev/null; then \
-  rocm-smi --showallinfo 2>/dev/null | grep -E 'GPU\[|Memory|Util|Usage' | head -20 || echo 'N/A'; \
+  rocm-smi --showmeminfo vram 2>/dev/null | awk -F': ' '
+    /vram Total Memory \(MiB\)/ { idx=$1; gsub(/[^0-9]/,"",idx); total=$NF; gsub(/[^0-9]/,"",total) }
+    /vram Total Used Memory \(MiB\)/ { used=$NF; gsub(/[^0-9]/,"",used) }
+    total != "" && used != "" { printf "%s,Radeon,%s,%s,0\n", idx, used, total; total=""; used="" }' || echo 'N/A'; \
 else \
   lspci 2>/dev/null | grep -iE '3D|VGA|Display' | head -5 | sed 's/.*: //' || echo 'N/A'; \
 fi; \
