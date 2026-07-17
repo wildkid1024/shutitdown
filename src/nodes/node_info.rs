@@ -21,6 +21,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 // ==================== 配置模型 ====================
@@ -37,6 +39,7 @@ struct Machine {
 struct Config {
     machines: Vec<Machine>,
     private_key_path: Option<String>,
+    interval: u64,
 }
 
 // ==================== 单 GPU 信息 ====================
@@ -345,6 +348,8 @@ struct App {
     scroll_offset: usize,
     selected_row: usize,       // 当前选中的行索引（在各 tab 的数据行中）
     collapsed_nodes: HashSet<String>, // 折叠的节点名称集合
+    config: Config,
+    interval: u64,             // 自动刷新间隔（秒）
 }
 
 impl App {
@@ -870,46 +875,86 @@ fn main() {
     log_content.push_str("================================\n\n");
     let _ = fs::write("shutdown_log.txt", log_content);
 
+    // 自动刷新间隔
+    let interval = cfg.interval;
+
     // 启动 TUI
-    println!("\n采集完成，启动 TUI 仪表盘...");
-    start_tui(nodes);
+    println!("\n采集完成，启动 TUI 仪表盘（自动刷新间隔 {} 秒）...", cfg.interval);
+    start_tui(nodes, cfg, interval, passphrase);
 }
 
-fn start_tui(nodes: Vec<NodeInfo>) {
+fn start_tui(nodes: Vec<NodeInfo>, config: Config, interval: u64, passphrase: String) {
     enable_raw_mode().unwrap();
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen).unwrap();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    let mut app = App { nodes, current_tab: 0, scroll_offset: 0, selected_row: 0, collapsed_nodes: HashSet::new() };
+    let mut app = App {
+        nodes,
+        current_tab: 0,
+        scroll_offset: 0,
+        selected_row: 0,
+        collapsed_nodes: HashSet::new(),
+        config,
+        interval,
+    };
+
+    // 后台刷新线程
+    let (tx, rx) = mpsc::channel();
+    let machines: Vec<Machine> = app.config.machines.clone();
+    let key_path = get_private_key_path(&app.config.private_key_path);
+    let bg_passphrase = passphrase.clone();
+
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(interval));
+            let mut fresh_nodes: Vec<NodeInfo> = Vec::with_capacity(machines.len());
+            for m in &machines {
+                let info = collect_node_info(m, &key_path, &bg_passphrase);
+                fresh_nodes.push(info);
+            }
+            if tx.send(fresh_nodes).is_err() {
+                break;
+            }
+        }
+    });
+
+    let poll_timeout = Duration::from_millis(500);
 
     loop {
         terminal.draw(|f| ui(f, &mut app)).unwrap();
 
-        if let Ok(Event::Key(key)) = event::read() {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Right | KeyCode::Tab => {
-                    app.current_tab = (app.current_tab + 1) % TAB_NAMES.len();
-                    app.scroll_offset = 0;
-                    app.selected_row = 0;
+        // 检查是否有新数据到达（非阻塞）
+        while let Ok(fresh_nodes) = rx.try_recv() {
+            app.nodes = fresh_nodes;
+        }
+
+        if let Ok(true) = event::poll(poll_timeout) {
+            if let Ok(Event::Key(key)) = event::read() {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Right | KeyCode::Tab => {
+                        app.current_tab = (app.current_tab + 1) % TAB_NAMES.len();
+                        app.scroll_offset = 0;
+                        app.selected_row = 0;
+                    }
+                    KeyCode::Left => {
+                        app.current_tab = if app.current_tab == 0 { TAB_NAMES.len() - 1 } else { app.current_tab - 1 };
+                        app.scroll_offset = 0;
+                        app.selected_row = 0;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        app.select_next();
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        app.select_prev();
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        app.toggle_selected_node();
+                    }
+                    _ => {}
                 }
-                KeyCode::Left => {
-                    app.current_tab = if app.current_tab == 0 { TAB_NAMES.len() - 1 } else { app.current_tab - 1 };
-                    app.scroll_offset = 0;
-                    app.selected_row = 0;
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    app.select_next();
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    app.select_prev();
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    app.toggle_selected_node();
-                }
-                _ => {}
             }
         }
     }
