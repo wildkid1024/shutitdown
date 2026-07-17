@@ -5,6 +5,20 @@ private_key_path = ""
 check_retry_times = 3
 check_interval_ms = 1000
 
+# 配置节点
+[[machines]]
+ip = "192.168.100.26"
+user = "root"
+name = "配置节点-01"
+tag = "配置服务"
+
+# 配置节点
+[[machines]]
+ip = "192.168.100.27"
+user = "root"
+name = "配置节点-02"
+tag = "配置服务"
+
 
 # 算力服务
 [[machines]]

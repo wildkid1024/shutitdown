@@ -3,6 +3,10 @@ name = "batch_shutdown"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "node_info"
+path = "src/nodes/node_info.rs"
+
 [dependencies]
 chrono = "0.4"
 dialoguer = "0.10"

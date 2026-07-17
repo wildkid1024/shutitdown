@@ -362,13 +362,19 @@ impl App {
 
     /// 折叠/展开当前选中节点
     fn toggle_selected_node(&mut self) {
-        let vis = self.visible_nodes();
-        if self.selected_node_idx < vis.len() {
-            let name = &vis[self.selected_node_idx].name;
-            if self.collapsed_nodes.contains(name) {
-                self.collapsed_nodes.remove(name);
+        let name = {
+            let vis = self.visible_nodes();
+            if self.selected_node_idx < vis.len() {
+                Some(vis[self.selected_node_idx].name.clone())
             } else {
-                self.collapsed_nodes.insert(name.clone());
+                None
+            }
+        };
+        if let Some(name) = name {
+            if self.collapsed_nodes.contains(&name) {
+                self.collapsed_nodes.remove(&name);
+            } else {
+                self.collapsed_nodes.insert(name);
             }
         }
     }
@@ -588,13 +594,13 @@ fn render_gpu(f: &mut Frame, area: Rect, app: &App) {
     let nodes_with_gpu: Vec<&NodeInfo> = app.nodes.iter().filter(|n| !n.gpus.is_empty()).collect();
     for n in &nodes_with_gpu {
         let collapsed = app.collapsed_nodes.contains(&n.name);
-        // 节点摘要行
+        // 节点摘要行 — 显示平均内存和算力占用
+        let avg_mem_pct = n.gpus.iter().map(|g| parse_pct(&g.mem_util_pct)).sum::<f64>() / n.gpus.len() as f64;
+        let avg_comp_pct = n.gpus.iter().map(|g| parse_pct(&g.compute_util_pct)).sum::<f64>() / n.gpus.len() as f64;
         let summary = if collapsed {
-            let mem_pcts: Vec<String> = n.gpus.iter().map(|g| g.mem_util_pct.clone()).collect();
-            let comp_pcts: Vec<String> = n.gpus.iter().map(|g| g.compute_util_pct.clone()).collect();
-            format!(" ▶ {}({})", n.name, n.gpus.len())
+            format!(" ▶ {}({})  显存:{:.0}%  算力:{:.0}%", n.name, n.gpus.len(), avg_mem_pct, avg_comp_pct)
         } else {
-            format!(" ▼ {}({})", n.name, n.gpus.len())
+            format!(" ▼ {}({})  ", n.name, n.gpus.len())
         };
         rows.push(Row::new(vec![
             Cell::from(Span::styled(summary, Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan))),
@@ -769,7 +775,7 @@ fn start_tui(nodes: Vec<NodeInfo>) {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    let mut app = App { nodes, current_tab: 0, scroll_offset: 0 };
+    let mut app = App { nodes, current_tab: 0, scroll_offset: 0, collapsed_nodes: HashSet::new(), selected_node_idx: 0 };
 
     loop {
         terminal.draw(|f| ui(f, &mut app)).unwrap();
