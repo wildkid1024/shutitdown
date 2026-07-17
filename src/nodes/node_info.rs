@@ -259,7 +259,8 @@ echo '===MEM==='; \
   mem_total=$(free | awk '/^Mem:/{printf "%.0f",$2}'); \
   mem_used=$(free | awk '/^Mem:/{printf "%.0f",$3}'); \
   if [ -n "$mem_total" ] && [ "$mem_total" -ne 0 ] 2>/dev/null; then \
-    echo "$(free -h | awk '/^Mem:/{printf "%s/%s (%.0f%%)",$3,$2,$3*100/$2}')"; \
+    mem_pct=$((mem_used * 100 / mem_total)); \
+    echo "$(free -h | awk -v p="$mem_pct" '/^Mem:/{printf "%s/%s (%d%%)",$3,$2,p}')"; \
   else echo 'N/A'; fi; \
 echo '===LOADAVG==='; (cat /proc/loadavg 2>/dev/null | awk '{printf "%s %s %s",$1,$2,$3}' || echo 'N/A'); \
 echo '===GPU_CARDS==='; \
