@@ -333,42 +333,72 @@ struct App {
     nodes: Vec<NodeInfo>,
     current_tab: usize,
     scroll_offset: usize,
-    selected_node_idx: usize,  // 当前选中的节点索引
+    selected_row: usize,       // 当前选中的行索引（在各 tab 的数据行中）
     collapsed_nodes: HashSet<String>, // 折叠的节点名称集合
 }
 
 impl App {
-    /// 获取当前 tab 可见的节点列表（GPU tab 只返回有 GPU 的节点）
-    fn visible_nodes(&self) -> Vec<&NodeInfo> {
+    /// 计算当前 tab 的数据行总数
+    fn total_rows(&self) -> usize {
         match self.current_tab {
-            3 => self.nodes.iter().filter(|n| !n.gpus.is_empty()).collect(),
-            _ => self.nodes.iter().collect(),
-        }
-    }
-
-    /// 选中下一个/上一个节点
-    fn select_next_node(&mut self) {
-        let vis = self.visible_nodes();
-        if !vis.is_empty() {
-            self.selected_node_idx = (self.selected_node_idx + 1).min(vis.len() - 1);
-        }
-    }
-
-    fn select_prev_node(&mut self) {
-        if self.selected_node_idx > 0 {
-            self.selected_node_idx -= 1;
-        }
-    }
-
-    /// 折叠/展开当前选中节点
-    fn toggle_selected_node(&mut self) {
-        let name = {
-            let vis = self.visible_nodes();
-            if self.selected_node_idx < vis.len() {
-                Some(vis[self.selected_node_idx].name.clone())
-            } else {
-                None
+            0 | 1 | 2 => self.nodes.len(),
+            3 => {
+                // GPU tab: 每个有 GPU 的节点一行摘要 + 展开时每 GPU 一行
+                let mut n = 0;
+                for node in &self.nodes {
+                    if !node.gpus.is_empty() {
+                        n += 1; // 摘要行
+                        if !self.collapsed_nodes.contains(&node.name) {
+                            n += node.gpus.len();
+                        }
+                    }
+                }
+                n
             }
+            4 => {
+                // 磁盘 tab: 每节点一行摘要 + 展开时每磁盘一行
+                let mut n = 0;
+                for node in &self.nodes {
+                    n += 1; // 摘要行
+                    if !self.collapsed_nodes.contains(&node.name) {
+                        n += node.disks.len();
+                    }
+                }
+                n
+            }
+            _ => 0,
+        }
+    }
+
+    /// 向下移动选中行
+    fn select_next(&mut self) {
+        let total = self.total_rows();
+        if total > 0 {
+            self.selected_row = (self.selected_row + 1).min(total - 1);
+            // 自动滚动：选中行超出可视区时跟随
+            if self.selected_row >= self.scroll_offset + 20 {
+                self.scroll_offset = self.selected_row.saturating_sub(10);
+            }
+        }
+    }
+
+    /// 向上移动选中行
+    fn select_prev(&mut self) {
+        if self.selected_row > 0 {
+            self.selected_row -= 1;
+            // 自动滚动：选中行移出可视区上方时跟随
+            if self.selected_row < self.scroll_offset {
+                self.scroll_offset = self.selected_row;
+            }
+        }
+    }
+
+    /// 折叠/展开当前选中行对应的节点（仅在 GPU/Disk tab 有效）
+    fn toggle_selected_node(&mut self) {
+        let name = match self.current_tab {
+            3 => self.node_name_at_gpu_row(self.selected_row),
+            4 => self.node_name_at_disk_row(self.selected_row),
+            _ => None,
         };
         if let Some(name) = name {
             if self.collapsed_nodes.contains(&name) {
@@ -377,6 +407,45 @@ impl App {
                 self.collapsed_nodes.insert(name);
             }
         }
+    }
+
+    /// GPU tab: 根据行号找出对应的节点名
+    fn node_name_at_gpu_row(&self, row: usize) -> Option<String> {
+        let mut r = 0;
+        for node in &self.nodes {
+            if node.gpus.is_empty() {
+                continue;
+            }
+            if r == row {
+                return Some(node.name.clone());
+            }
+            r += 1;
+            if !self.collapsed_nodes.contains(&node.name) {
+                r += node.gpus.len();
+                if r > row {
+                    return Some(node.name.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Disk tab: 根据行号找出对应的节点名
+    fn node_name_at_disk_row(&self, row: usize) -> Option<String> {
+        let mut r = 0;
+        for node in &self.nodes {
+            if r == row {
+                return Some(node.name.clone());
+            }
+            r += 1;
+            if !self.collapsed_nodes.contains(&node.name) {
+                r += node.disks.len();
+                if r > row {
+                    return Some(node.name.clone());
+                }
+            }
+        }
+        None
     }
 }
 
@@ -475,10 +544,12 @@ fn render_overview(f: &mut Frame, area: Rect, app: &App) {
     let rows: Vec<Row> = {
         let start = app.scroll_offset;
         let visible: Vec<&NodeInfo> = app.nodes.iter().skip(start).take(20).collect();
-        visible.iter().map(|n| {
+        visible.iter().enumerate().map(|(i, n)| {
             let disk_usage = n.disks.first().map(|d| d.usage_pct.clone()).unwrap_or_else(|| "N/A".into());
             let mem_text = format!("{}/{}", n.memory.used, n.memory.total);
             let gpu_text = if n.gpus.is_empty() { "N/A".into() } else { format!("{}卡", n.gpus.len()) };
+            let is_selected = start + i == app.selected_row;
+            let row_style = if is_selected { Style::default().bg(Color::Blue).fg(Color::White) } else { Style::default() };
             Row::new(vec![
                 Cell::from(n.name.as_str()),
                 Cell::from(n.tag.as_str()),
@@ -490,7 +561,7 @@ fn render_overview(f: &mut Frame, area: Rect, app: &App) {
                 Cell::from(mem_text),
                 Cell::from(disk_usage),
                 Cell::from(n.uptime.as_str()),
-            ])
+            ]).style(row_style)
         }).collect()
     };
 
@@ -519,14 +590,16 @@ fn render_cpu(f: &mut Frame, area: Rect, app: &App) {
     let rows: Vec<Row> = {
         let start = app.scroll_offset;
         let visible: Vec<&NodeInfo> = app.nodes.iter().skip(start).take(30).collect();
-        visible.iter().map(|n| {
+        visible.iter().enumerate().map(|(i, n)| {
+            let is_selected = start + i == app.selected_row;
+            let row_style = if is_selected { Style::default().bg(Color::Blue).fg(Color::White) } else { Style::default() };
             Row::new(vec![
                 Cell::from(n.name.as_str()),
                 Cell::from(n.cpu_arch.as_str()),
                 Cell::from(n.cpu.model.as_str()),
                 Cell::from(n.cpu.cores.as_str()),
                 Cell::from(n.load_avg.as_str()),
-            ])
+            ]).style(row_style)
         }).collect()
     };
 
@@ -555,16 +628,18 @@ fn render_memory(f: &mut Frame, area: Rect, app: &App) {
     let rows: Vec<Row> = {
         let start = app.scroll_offset;
         let visible: Vec<&NodeInfo> = app.nodes.iter().skip(start).take(30).collect();
-        visible.iter().map(|n| {
+        visible.iter().enumerate().map(|(i, n)| {
             let pct = parse_pct(&n.memory.pct);
             let color = pct_color(pct);
             let bar = text_bar(pct, 20);
+            let is_selected = start + i == app.selected_row;
+            let row_style = if is_selected { Style::default().bg(Color::Blue).fg(Color::White) } else { Style::default() };
             Row::new(vec![
                 Cell::from(n.name.as_str()),
                 Cell::from(n.memory.used.as_str()),
                 Cell::from(n.memory.total.as_str()),
                 Cell::from(Span::styled(bar, Style::default().fg(color))),
-            ])
+            ]).style(row_style)
         }).collect()
     };
 
@@ -592,6 +667,7 @@ fn render_gpu(f: &mut Frame, area: Rect, app: &App) {
 
     let mut rows = Vec::new();
     let nodes_with_gpu: Vec<&NodeInfo> = app.nodes.iter().filter(|n| !n.gpus.is_empty()).collect();
+    let mut row_idx = 0usize;
     for n in &nodes_with_gpu {
         let collapsed = app.collapsed_nodes.contains(&n.name);
         // 节点摘要行 — 显示平均内存和算力占用
@@ -602,14 +678,21 @@ fn render_gpu(f: &mut Frame, area: Rect, app: &App) {
         } else {
             format!(" ▼ {}({})  ", n.name, n.gpus.len())
         };
+        let is_selected = row_idx == app.selected_row;
+        let summary_style = if is_selected {
+            Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)
+        };
         rows.push(Row::new(vec![
-            Cell::from(Span::styled(summary, Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan))),
+            Cell::from(Span::styled(summary, summary_style)),
             Cell::from(""),
             Cell::from(""),
             Cell::from(""),
             Cell::from(""),
             Cell::from(""),
-        ]));
+        ]).style(if is_selected { Style::default().bg(Color::Blue) } else { Style::default() }));
+        row_idx += 1;
 
         // 展开时显示每卡详情
         if !collapsed {
@@ -621,6 +704,8 @@ fn render_gpu(f: &mut Frame, area: Rect, app: &App) {
                 let mem_color = pct_color(mem_pct);
                 let comp_color = pct_color(comp_pct);
 
+                let is_selected = row_idx == app.selected_row;
+                let row_style = if is_selected { Style::default().bg(Color::Blue).fg(Color::White) } else { Style::default() };
                 rows.push(Row::new(vec![
                     Cell::from(""),
                     Cell::from(gpu.index.as_str()),
@@ -628,7 +713,8 @@ fn render_gpu(f: &mut Frame, area: Rect, app: &App) {
                     Cell::from(format!("{}/{}", gpu.mem_used_mb, gpu.mem_total_mb)),
                     Cell::from(Span::styled(mem_bar, Style::default().fg(mem_color))),
                     Cell::from(Span::styled(comp_bar, Style::default().fg(comp_color))),
-                ]));
+                ]).style(row_style));
+                row_idx += 1;
             }
         }
     }
@@ -658,6 +744,7 @@ fn render_disk(f: &mut Frame, area: Rect, app: &App) {
     let header_row = Row::new(header_cells).style(Style::default().bg(Color::DarkGray));
 
     let mut rows = Vec::new();
+    let mut row_idx = 0usize;
     for n in &app.nodes {
         let collapsed = app.collapsed_nodes.contains(&n.name);
         let summary = if collapsed {
@@ -665,20 +752,29 @@ fn render_disk(f: &mut Frame, area: Rect, app: &App) {
         } else {
             format!(" ▼ {}", n.name)
         };
+        let is_selected = row_idx == app.selected_row;
+        let summary_style = if is_selected {
+            Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)
+        };
         rows.push(Row::new(vec![
-            Cell::from(Span::styled(summary, Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan))),
+            Cell::from(Span::styled(summary, summary_style)),
             Cell::from(""),
             Cell::from(""),
             Cell::from(""),
             Cell::from(""),
             Cell::from(""),
-        ]));
+        ]).style(if is_selected { Style::default().bg(Color::Blue) } else { Style::default() }));
+        row_idx += 1;
 
         if !collapsed {
             for disk in &n.disks {
                 let pct = parse_pct(&disk.usage_pct);
                 let color = pct_color(pct);
                 let bar = text_bar(pct, 24);
+                let is_selected = row_idx == app.selected_row;
+                let row_style = if is_selected { Style::default().bg(Color::Blue).fg(Color::White) } else { Style::default() };
                 rows.push(Row::new(vec![
                     Cell::from(""),
                     Cell::from(disk.mount.as_str()),
@@ -686,7 +782,8 @@ fn render_disk(f: &mut Frame, area: Rect, app: &App) {
                     Cell::from(disk.used.as_str()),
                     Cell::from(disk.avail.as_str()),
                     Cell::from(Span::styled(bar, Style::default().fg(color))),
-                ]));
+                ]).style(row_style));
+                row_idx += 1;
             }
         }
     }
@@ -775,7 +872,7 @@ fn start_tui(nodes: Vec<NodeInfo>) {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    let mut app = App { nodes, current_tab: 0, scroll_offset: 0, collapsed_nodes: HashSet::new(), selected_node_idx: 0 };
+    let mut app = App { nodes, current_tab: 0, scroll_offset: 0, selected_row: 0, collapsed_nodes: HashSet::new() };
 
     loop {
         terminal.draw(|f| ui(f, &mut app)).unwrap();
@@ -786,16 +883,21 @@ fn start_tui(nodes: Vec<NodeInfo>) {
                 KeyCode::Right | KeyCode::Tab => {
                     app.current_tab = (app.current_tab + 1) % TAB_NAMES.len();
                     app.scroll_offset = 0;
+                    app.selected_row = 0;
                 }
                 KeyCode::Left => {
                     app.current_tab = if app.current_tab == 0 { TAB_NAMES.len() - 1 } else { app.current_tab - 1 };
                     app.scroll_offset = 0;
+                    app.selected_row = 0;
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    app.scroll_offset += 1;
+                    app.select_next();
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    app.scroll_offset = app.scroll_offset.saturating_sub(1);
+                    app.select_prev();
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    app.toggle_selected_node();
                 }
                 _ => {}
             }
