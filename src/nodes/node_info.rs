@@ -261,11 +261,11 @@ echo '===CPU_MODEL==='; (cat /proc/cpuinfo 2>/dev/null | grep 'model name' | hea
 echo '===CPU_CORES==='; nproc 2>/dev/null || echo '0'; \
 echo '===CPU_ARCH==='; uname -m 2>/dev/null || echo 'N/A'; \
 echo '===MEM==='; \
-  mem_total=$(free | awk '/^Mem:/{printf "%.0f",$2}'); \
-  mem_used=$(free | awk '/^Mem:/{printf "%.0f",$3}'); \
+  mem_total=$(free | awk 'NR==2{printf "%.0f",$2}'); \
+  mem_used=$(free | awk 'NR==2{printf "%.0f",$3}'); \
   if [ -n "$mem_total" ] && [ "$mem_total" -ne 0 ] 2>/dev/null; then \
     mem_pct=$((mem_used * 100 / mem_total)); \
-    echo "$(free -h | awk -v p="$mem_pct" '/^Mem:/{printf "%s/%s (%d%%)",$3,$2,p}')"; \
+    echo "$(free -h | awk -v p="$mem_pct" 'NR==2{printf "%s/%s (%d%%)",$3,$2,p}')"; \
   else echo 'N/A'; fi; \
 echo '===LOADAVG==='; (cat /proc/loadavg 2>/dev/null | awk '{printf "%s %s %s",$1,$2,$3}' || echo 'N/A'); \
 echo '===GPU_CARDS==='; \
