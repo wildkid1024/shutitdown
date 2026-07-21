@@ -349,7 +349,7 @@ struct App {
     selected_row: usize,       // 当前选中的行索引（在各 tab 的数据行中）
     collapsed_nodes: HashSet<String>, // 折叠的节点名称集合
     config: Config,
-    interval: u64,             // 自动刷新间隔（秒）
+    last_refresh: String,      // 上次刷新时间标记
 }
 
 impl App {
@@ -497,9 +497,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
+    let title = format!(" 节点监控仪表盘 (上次刷新: {}) ", app.last_refresh);
     let tabs = Tabs::new(TAB_NAMES.iter().map(|t| t.to_string()).collect::<Vec<_>>())
         .select(app.current_tab)
-        .block(Block::default().title(" 节点监控仪表盘 ").borders(Borders::ALL))
+        .block(Block::default().title(title).borders(Borders::ALL))
         .style(Style::default().fg(Color::White))
         .highlight_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))
         .divider(" │ ");
@@ -897,18 +898,18 @@ fn start_tui(nodes: Vec<NodeInfo>, config: Config, interval: u64, passphrase: St
         selected_row: 0,
         collapsed_nodes: HashSet::new(),
         config,
-        interval,
+        last_refresh: Local::now().format("%H:%M:%S").to_string(),
     };
 
-    // 后台刷新线程
+    // 后台刷新线程：先采集再等待，让第一次刷新尽快到来
     let (tx, rx) = mpsc::channel();
     let machines: Vec<Machine> = app.config.machines.clone();
     let key_path = get_private_key_path(&app.config.private_key_path);
     let bg_passphrase = passphrase.clone();
+    let refresh_interval = if interval == 0 { 5 } else { interval };
 
     thread::spawn(move || {
         loop {
-            thread::sleep(Duration::from_secs(interval));
             let mut fresh_nodes: Vec<NodeInfo> = Vec::with_capacity(machines.len());
             for m in &machines {
                 let info = collect_node_info(m, &key_path, &bg_passphrase);
@@ -917,6 +918,7 @@ fn start_tui(nodes: Vec<NodeInfo>, config: Config, interval: u64, passphrase: St
             if tx.send(fresh_nodes).is_err() {
                 break;
             }
+            thread::sleep(Duration::from_secs(refresh_interval));
         }
     });
 
@@ -928,6 +930,7 @@ fn start_tui(nodes: Vec<NodeInfo>, config: Config, interval: u64, passphrase: St
         // 检查是否有新数据到达（非阻塞）
         while let Ok(fresh_nodes) = rx.try_recv() {
             app.nodes = fresh_nodes;
+            app.last_refresh = Local::now().format("%H:%M:%S").to_string();
         }
 
         if let Ok(true) = event::poll(poll_timeout) {
