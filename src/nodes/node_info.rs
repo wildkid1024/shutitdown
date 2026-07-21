@@ -910,12 +910,15 @@ fn start_tui(nodes: Vec<NodeInfo>, config: Config, interval: u64, passphrase: St
 
     thread::spawn(move || {
         loop {
-            let mut fresh_nodes: Vec<NodeInfo> = Vec::with_capacity(machines.len());
-            for m in &machines {
-                let info = collect_node_info(m, &key_path, &bg_passphrase);
-                fresh_nodes.push(info);
-            }
-            if tx.send(fresh_nodes).is_err() {
+            // 多线程并行采集所有节点
+            let results = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(machines.len());
+                for m in &machines {
+                    handles.push(s.spawn(|| collect_node_info(m, &key_path, &bg_passphrase)));
+                }
+                handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<NodeInfo>>()
+            });
+            if tx.send(results).is_err() {
                 break;
             }
             thread::sleep(Duration::from_secs(refresh_interval));
