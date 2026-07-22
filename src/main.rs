@@ -6,6 +6,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 use serde::Deserialize;
 use dirs::home_dir;
@@ -66,32 +68,37 @@ fn get_private_key_path(cfg_path: &str) -> PathBuf {
     path
 }
 
-/// SSH下发关机指令
-fn ssh_shutdown(m: &Machine, cmd: &str, key_path: &PathBuf, key_passphrase: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let addr: SocketAddr = format!("{}:22", m.ip).parse()?;
+/// SSH下发关机指令（参数均为引用类型，适合多线程闭包中 clone 后传入）
+fn ssh_shutdown_raw(
+    ip: &str,
+    user: &str,
+    cmd: &str,
+    key_path: &PathBuf,
+    key_passphrase: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let addr: SocketAddr = format!("{}:22", ip).parse()?;
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
     let mut sess = Session::new()?;
     sess.set_tcp_stream(tcp);
     sess.handshake()?;
 
     sess.userauth_pubkey_file(
-        &m.user,
+        user,
         None,
         key_path,
         if key_passphrase.is_empty() { None } else { Some(key_passphrase) },
     )?;
 
     if !sess.authenticated() {
-        return Err(format!("{} 私钥认证失败", m.ip).into());
+        return Err(format!("{} 私钥认证失败", ip).into());
     }
 
     let mut channel = sess.channel_session()?;
     channel.exec(cmd)?;
-    // channel.wait_close()?;
 
     let _ = channel.send_eof();
     let _ = channel.wait_eof();
-    
+
     Ok(())
 }
 
@@ -216,23 +223,44 @@ fn main() {
         return;
     }
 
-    // 1.下发关机指令
+    // 1.多线程下发关机指令
     println!("\n[1/3] 下发关机指令...");
     write_log("开始批量下发关机指令");
-    for m in &selected_machines {
-        match ssh_shutdown(m, &cfg.shutdown_command, &key_path, &key_passphrase) {
-            Ok(_) => {
-                let msg = format!("[{}] 关机指令下发成功", m.ip);
-                println!("{}", msg);
-                write_log(&msg);
-            }
-            Err(e) => {
-                let msg = format!("[{}] 下发失败：{}", m.ip, e);
-                eprintln!("{}", msg);
-                write_log(&msg);
+    {
+        let (tx, rx) = mpsc::channel::<(String, Result<(), String>)>();
+        let mut handles = Vec::with_capacity(selected_machines.len());
+        for m in &selected_machines {
+            let ip = m.ip.clone();
+            let user = m.user.clone();
+            let cmd = cfg.shutdown_command.clone();
+            let key = key_path.clone();
+            let pass = key_passphrase.clone();
+            let tx = tx.clone();
+            handles.push(thread::spawn(move || {
+                let result = ssh_shutdown_raw(&ip, &user, &cmd, &key, &pass)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send((ip.clone(), result));
+                // 等待一小段时间，避免 sshd 过载
+                thread::sleep(Duration::from_millis(200));
+            }));
+        }
+        drop(tx);
+        for _ in 0..selected_machines.len() {
+            if let Ok((ip, result)) = rx.recv() {
+                match result {
+                    Ok(_) => {
+                        let msg = format!("[{}] 关机指令下发成功", ip);
+                        println!("{}", msg);
+                        write_log(&msg);
+                    }
+                    Err(e) => {
+                        let msg = format!("[{}] 下发失败：{}", ip, e);
+                        eprintln!("{}", msg);
+                        write_log(&msg);
+                    }
+                }
             }
         }
-        std::thread::sleep(Duration::from_millis(200));
     }
 
     // 2.等待关机冷却
@@ -240,15 +268,31 @@ fn main() {
     write_log(&format!("等待{}秒后开始状态检测", cfg.shutdown_delay_sec));
     std::thread::sleep(Duration::from_secs(cfg.shutdown_delay_sec));
 
-    // 3.带重试检测机器状态
+    // 3.多线程检测机器状态
     println!("\n[3/3] 检测机器在线状态（重试次数：{}）...", cfg.check_retry_times);
     write_log("开始批量检测服务器关机状态");
     let mut result_list = Vec::new();
-    for m in &selected_machines {
-        let status = check_machine_offline_with_retry(&m.ip, cfg.check_retry_times, cfg.check_interval_ms);
-        result_list.push((m.ip.clone(), status.clone()));
-        let log_msg = format!("[{}] 检测结果: {}", m.ip, status);
-        write_log(&log_msg);
+    {
+        let (tx, rx) = mpsc::channel::<(String, MachineStatus)>();
+        let mut handles = Vec::with_capacity(selected_machines.len());
+        for m in &selected_machines {
+            let ip = m.ip.clone();
+            let tx = tx.clone();
+            let retry = cfg.check_retry_times;
+            let interval = cfg.check_interval_ms;
+            handles.push(thread::spawn(move || {
+                let status = check_machine_offline_with_retry(&ip, retry, interval);
+                let _ = tx.send((ip, status));
+            }));
+        }
+        drop(tx);
+        for _ in 0..selected_machines.len() {
+            if let Ok((ip, status)) = rx.recv() {
+                let log_msg = format!("[{}] 检测结果: {}", ip, status);
+                write_log(&log_msg);
+                result_list.push((ip, status));
+            }
+        }
     }
 
     // 汇总输出
