@@ -16,7 +16,7 @@ use ratatui::{
 };
 use serde::Deserialize;
 use ssh2::Session;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -52,6 +52,7 @@ struct GpuInfo {
     mem_total_mb: String,
     mem_util_pct: String,
     compute_util_pct: String,
+    containers: String,  // 该 GPU 上运行的 Docker 容器名（逗号分隔）
 }
 
 // ==================== 磁盘分区信息 ====================
@@ -177,7 +178,23 @@ fn extract_line(output: &str, key: &str) -> String {
     extract_section(output, key).lines().next().unwrap_or("N/A").trim().to_string()
 }
 
-fn parse_gpu_cards(raw: &str) -> Vec<GpuInfo> {
+fn parse_gpu_cards(raw: &str, docker_raw: &str) -> Vec<GpuInfo> {
+    // 构建 GPU 索引 → Docker 容器名的映射
+    let mut gpu_containers: HashMap<String, Vec<String>> = HashMap::new();
+    for line in docker_raw.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if let Some((gpu_idx, cname)) = line.split_once(',') {
+            let gpu_idx = gpu_idx.trim();
+            let cname = cname.trim();
+            if !gpu_idx.is_empty() && !cname.is_empty() {
+                gpu_containers.entry(gpu_idx.to_string())
+                    .or_default()
+                    .push(cname.to_string());
+            }
+        }
+    }
+
     let mut gpus = Vec::new();
     for line in raw.lines() {
         let line = line.trim();
@@ -188,24 +205,39 @@ fn parse_gpu_cards(raw: &str) -> Vec<GpuInfo> {
             let mem_total = parts[3].trim();
             // NPU 格式（6 字段）：index, model, mem_used, mem_total, mem_util, compute_util
             // Nvidia 格式（5 字段）：index, model, mem_used, mem_total, compute_util
+            let parse_mem_val = |s: &str| -> Option<f64> {
+                let s = s.trim();
+                if let Ok(v) = s.parse::<f64>() { return Some(v); }
+                // 处理 "1234 MiB" 格式
+                if let Some(v) = s.split_whitespace().next().and_then(|n| n.parse::<f64>().ok()) { return Some(v); }
+                None
+            };
             let mem_util = if parts.len() >= 6 {
+                // NPU：取 utilization 字段
                 parts[4].to_string()
-            } else if let (Ok(u), Ok(t)) = (mem_used.parse::<f64>(), mem_total.parse::<f64>()) {
+            } else if let (Some(u), Some(t)) = (parse_mem_val(mem_used), parse_mem_val(mem_total)) {
                 if t > 0.0 { format!("{:.0}", u / t * 100.0) } else { "0".into() }
             } else { "N/A".into() };
             let compute_util_idx = if parts.len() >= 6 { 5 } else { 4 };
+            // 算力利用率去掉 % 后缀
+            let compute_util = parts[compute_util_idx].trim().trim_end_matches('%').trim().to_string();
             let fmt_mem = |v: &str| -> String {
                 if let Ok(mb) = v.parse::<f64>() {
                     if mb >= 1024.0 { format!("{:.1}G", mb / 1024.0) } else { format!("{:.0}M", mb) }
                 } else { v.to_string() }
             };
+            let idx = parts[0].to_string();
+            let containers = gpu_containers.remove(&idx)
+                .map(|v| v.join(", "))
+                .unwrap_or_default();
             gpus.push(GpuInfo {
-                index: parts[0].to_string(),
+                index: idx,
                 model: parts[1].trim().to_string(),
                 mem_used_mb: fmt_mem(mem_used),
                 mem_total_mb: fmt_mem(mem_total),
                 mem_util_pct: mem_util,
-                compute_util_pct: parts[compute_util_idx].to_string(),
+                compute_util_pct: compute_util,
+                containers,
             });
         }
     }
@@ -273,7 +305,7 @@ echo '===MEM==='; \
 echo '===LOADAVG==='; (cat /proc/loadavg 2>/dev/null | awk '{printf "%s %s %s",$1,$2,$3}' || echo 'N/A'); \
 echo '===GPU_CARDS==='; \
 if command -v nvidia-smi &>/dev/null; then \
-  nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits 2>/dev/null || echo 'N/A'; \
+  nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null || echo 'N/A'; \
 elif command -v npu-smi &>/dev/null; then \
   npu_list=$(npu-smi info -l 2>/dev/null | grep -c 'NPU'); \
   if [ "$npu_list" -gt 0 ] 2>/dev/null; then \
@@ -294,6 +326,22 @@ elif command -v rocm-smi &>/dev/null; then \
     total != "" && used != "" { printf "%s,Radeon,%s,%s,0\n", idx, used, total; total=""; used="" }' || echo 'N/A'; \
 else \
   lspci 2>/dev/null | grep -iE '3D|VGA|Display' | head -5 | sed 's/.*: //' || echo 'N/A'; \
+fi; \
+echo '===GPU_DOCKER==='; \
+if command -v nvidia-smi &>/dev/null; then \
+  nvidia-smi --query-compute-apps=index,pid --format=csv,noheader,nounits 2>/dev/null | while IFS=', ' read -r gpu_idx pid; do \
+    if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then \
+      cname=$(docker ps --no-trunc --format '{{.ID}} {{.Names}}' 2>/dev/null | while read -r cid cname; do \
+        if docker inspect "$cid" 2>/dev/null | grep -q '"pid": '$pid',\|"pid":'$pid' '; then echo "$cname"; break; fi; \
+      done); \
+      if [ -n "$cname" ]; then echo "$gpu_idx,$cname"; fi; \
+    fi; \
+  done; \
+elif command -v npu-smi &>/dev/null; then \
+  docker ps --no-trunc --format '{{.ID}} {{.Names}} {{.Command}}' 2>/dev/null | grep -i npu-smi | while read -r cid cname cmd; do \
+    npu_idx=$(echo "$cmd" | grep -oP 'np[_-]?device[=: ][0-9]+|device=[0-9]+' | grep -oP '[0-9]+$' | head -1); \
+    if [ -n "$npu_idx" ]; then echo "$npu_idx,$cname"; fi; \
+  done; \
 fi; \
 echo '===DISKS==='; \
   df -h 2>/dev/null | awk 'NR>1 {printf "%s,%s,%s,%s,%s\n", $6,$2,$3,$4,$5}' || echo 'N/A'; \
@@ -316,8 +364,9 @@ fn collect_node_info(m: &Machine, key_path: &PathBuf, passphrase: &str) -> NodeI
             let mem_raw = extract_line(&output, "MEM");
             let load_avg = extract_line(&output, "LOADAVG");
             let gpu_raw = extract_section(&output, "GPU_CARDS");
+            let docker_raw = extract_section(&output, "GPU_DOCKER");
             let disk_raw = extract_section(&output, "DISKS");
-            let gpus = parse_gpu_cards(&gpu_raw);
+            let gpus = parse_gpu_cards(&gpu_raw, &docker_raw);
             let disks = parse_disks(&disk_raw);
             NodeInfo {
                 name, tag, ip: m.ip.clone(), online: true,
@@ -672,10 +721,11 @@ fn render_gpu(f: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Min(0)])
         .split(area);
 
-    let headers = vec!["节点", "GPU#", "型号", "显存(已用/总量)", "显存占用", "算力占用"];
+    let headers = vec!["节点", "GPU#", "型号", "显存(已用/总量)", "显存占用", "算力占用", "容器服务"];
     let widths = [
         Constraint::Length(14), Constraint::Length(6), Constraint::Length(18),
-        Constraint::Length(18), Constraint::Length(30), Constraint::Length(30),
+        Constraint::Length(18), Constraint::Length(24), Constraint::Length(24),
+        Constraint::Length(20),
     ];
 
     let header_cells = headers.iter().map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
@@ -707,6 +757,7 @@ fn render_gpu(f: &mut Frame, area: Rect, app: &App) {
             Cell::from(""),
             Cell::from(""),
             Cell::from(""),
+            Cell::from(""),
         ]).style(if is_selected { Style::default().bg(Color::Blue) } else { Style::default() }));
         row_idx += 1;
 
@@ -715,13 +766,14 @@ fn render_gpu(f: &mut Frame, area: Rect, app: &App) {
             for gpu in &n.gpus {
                 let mem_pct = parse_pct(&gpu.mem_util_pct);
                 let comp_pct = parse_pct(&gpu.compute_util_pct);
-                let mem_bar = text_bar(mem_pct, 14);
-                let comp_bar = text_bar(comp_pct, 14);
+                let mem_bar = text_bar(mem_pct, 12);
+                let comp_bar = text_bar(comp_pct, 12);
                 let mem_color = pct_color(mem_pct);
                 let comp_color = pct_color(comp_pct);
 
                 let is_selected = row_idx == app.selected_row;
                 let row_style = if is_selected { Style::default().bg(Color::Blue).fg(Color::White) } else { Style::default() };
+                let container_text = if gpu.containers.is_empty() { "".into() } else { gpu.containers.clone() };
                 rows.push(Row::new(vec![
                     Cell::from(""),
                     Cell::from(gpu.index.as_str()),
@@ -729,6 +781,7 @@ fn render_gpu(f: &mut Frame, area: Rect, app: &App) {
                     Cell::from(format!("{}/{}", gpu.mem_used_mb, gpu.mem_total_mb)),
                     Cell::from(Span::styled(mem_bar, Style::default().fg(mem_color))),
                     Cell::from(Span::styled(comp_bar, Style::default().fg(comp_color))),
+                    Cell::from(container_text),
                 ]).style(row_style));
                 row_idx += 1;
             }
