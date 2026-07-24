@@ -7,6 +7,10 @@ edition = "2021"
 name = "node_info"
 path = "src/nodes/node_info.rs"
 
+[[bin]]
+name = "node-agent"
+path = "src/agent/main.rs"
+
 [dependencies]
 chrono = "0.4"
 dialoguer = "0.10"
@@ -16,3 +20,14 @@ dirs = "5.0"
 toml = "0.8"
 ratatui = "0.29"
 crossterm = "0.28"
+
+# agent-server 依赖
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-stream = "0.1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+
+[build-dependencies]
+tonic-build = "0.12"

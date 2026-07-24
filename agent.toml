@@ -1,0 +1,16 @@
+# Agent gRPC 节点配置（供 node-agent dashboard 使用）
+# 每个被控节点需先启动：node-agent serve
+
+interval = 5  # 自动刷新间隔（秒），默认 5
+
+
+[[machines]]
+ip = "192.168.100.22"
+name = "算力节点-01"
+tag = "算力服务"
+
+
+[[machines]]
+ip = "192.168.100.31"
+name = "算力节点-02"
+tag = "算力服务"

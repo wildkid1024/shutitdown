@@ -1,0 +1,130 @@
+syntax = "proto3";
+
+package node_agent;
+
+// ──────────────────────────────────────
+// 节点 Agent 服务
+// ──────────────────────────────────────
+
+service NodeAgent {
+  // 心跳 / 健康检查
+  rpc Ping(PingRequest) returns (PingResponse);
+
+  // 采集节点完整信息
+  rpc GetNodeInfo(GetNodeInfoRequest) returns (NodeInfo);
+
+  // 执行任意 shell 命令
+  rpc Exec(ExecRequest) returns (ExecResponse);
+
+  // 下发关机指令
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+
+  // 服务端推送事件流（状态变更、告警等）
+  rpc WatchEvents(WatchRequest) returns (stream NodeEvent);
+}
+
+// ──────────────────────────────────────
+// 基础消息
+// ──────────────────────────────────────
+
+message PingRequest {
+  string client_id = 1;
+}
+
+message PingResponse {
+  bool alive = 1;
+  string agent_version = 2;
+  int64 uptime_seconds = 3;
+  double load_1m = 4;
+}
+
+message GetNodeInfoRequest {}
+
+// ──────────────────────────────────────
+// 节点信息
+// ──────────────────────────────────────
+
+message NodeInfo {
+  string hostname = 1;
+  string os = 2;
+  string cpu_model = 3;
+  int32 cpu_cores = 4;
+  string cpu_arch = 5;
+  MemoryInfo memory = 6;
+  repeated GpuInfo gpus = 7;
+  repeated DiskInfo disks = 8;
+  string uptime = 9;
+  string load_avg = 10;
+  string agent_version = 11;
+  int64 uptime_seconds = 12;
+}
+
+message MemoryInfo {
+  string total = 1;
+  string used = 2;
+  string pct = 3;
+}
+
+message GpuInfo {
+  string index = 1;
+  string model = 2;
+  string mem_used = 3;
+  string mem_total = 4;
+  string mem_util_pct = 5;
+  string compute_util_pct = 6;
+  string containers = 7;
+}
+
+message DiskInfo {
+  string mount = 1;
+  string total = 2;
+  string used = 3;
+  string avail = 4;
+  string usage_pct = 5;
+}
+
+// ──────────────────────────────────────
+// 命令执行
+// ──────────────────────────────────────
+
+message ExecRequest {
+  string command = 1;
+  int32 timeout_secs = 2;     // 0 表示不限
+}
+
+message ExecResponse {
+  int32 exit_code = 1;
+  string stdout = 2;
+  string stderr = 3;
+}
+
+// ──────────────────────────────────────
+// 关机
+// ──────────────────────────────────────
+
+message ShutdownRequest {
+  string reason = 1;
+  int32 delay_secs = 2;       // 延迟秒数
+}
+
+message ShutdownResponse {
+  bool scheduled = 1;
+  string message = 2;
+}
+
+// ──────────────────────────────────────
+// 事件推送
+// ──────────────────────────────────────
+
+message WatchRequest {
+  // 订阅的事件类型，空列表表示全部
+  repeated string event_types = 1;
+}
+
+message NodeEvent {
+  string event_type = 1;      // "disk_high", "cpu_high", "memory_high", "heartbeat", "shutdown"
+  string severity = 2;        // "info", "warn", "critical"
+  string message = 3;
+  int64 timestamp = 4;
+  map<string, string> attributes = 5;
+}
