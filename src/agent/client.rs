@@ -23,19 +23,28 @@ pub struct AgentConnection {
 #[derive(Debug, Clone)]
 pub struct AgentClient {
     endpoint: String,
+    timeout_secs: u64,
 }
 
 impl AgentClient {
     pub fn new(ip: &str, port: u16) -> Self {
         Self {
             endpoint: format!("http://{}:{}", ip, port),
+            timeout_secs: 30,
+        }
+    }
+
+    pub fn with_timeout(ip: &str, port: u16, timeout_secs: u64) -> Self {
+        Self {
+            endpoint: format!("http://{}:{}", ip, port),
+            timeout_secs,
         }
     }
 
     fn client(&self) -> Result<NodeAgentClient<tonic::transport::Channel>, tonic::transport::Error> {
         let endpoint = Endpoint::from_shared(self.endpoint.clone())?
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(10));
+            .connect_timeout(std::time::Duration::from_secs(5.min(self.timeout_secs)))
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
         let channel = endpoint.connect_lazy();
         Ok(NodeAgentClient::new(channel))
     }
@@ -131,12 +140,20 @@ pub fn format_node_info(info: &NodeInfo) -> String {
 pub async fn batch_scan(
     targets: &[(String, u16)],
 ) -> HashMap<String, Result<AgentConnection, String>> {
+    batch_scan_with_timeout(targets, 30).await
+}
+
+/// 并发批量扫描节点（自定义超时）
+pub async fn batch_scan_with_timeout(
+    targets: &[(String, u16)],
+    timeout_secs: u64,
+) -> HashMap<String, Result<AgentConnection, String>> {
     use futures::future::join_all;
 
     let tasks: Vec<_> = targets
         .iter()
         .map(|(ip, port)| {
-            let client = AgentClient::new(ip, *port);
+            let client = AgentClient::with_timeout(ip, *port, timeout_secs);
             async move { (ip.clone(), client.ping().await) }
         })
         .collect();
@@ -153,12 +170,20 @@ pub async fn batch_scan(
 pub async fn batch_collect(
     targets: &[(String, u16)],
 ) -> HashMap<String, Result<NodeInfo, String>> {
+    batch_collect_with_timeout(targets, 30).await
+}
+
+/// 并发采集多个节点的完整信息（自定义超时）
+pub async fn batch_collect_with_timeout(
+    targets: &[(String, u16)],
+    timeout_secs: u64,
+) -> HashMap<String, Result<NodeInfo, String>> {
     use futures::future::join_all;
 
     let tasks: Vec<_> = targets
         .iter()
         .map(|(ip, port)| {
-            let client = AgentClient::new(ip, *port);
+            let client = AgentClient::with_timeout(ip, *port, timeout_secs);
             async move { (ip.clone(), client.get_node_info().await) }
         })
         .collect();
@@ -177,13 +202,23 @@ pub async fn batch_shutdown(
     reason: &str,
     delay_secs: i32,
 ) -> Vec<(String, Result<String, String>)> {
+    batch_shutdown_with_timeout(targets, reason, delay_secs, 30).await
+}
+
+/// 并发批量关机（自定义超时）
+pub async fn batch_shutdown_with_timeout(
+    targets: &[(String, u16)],
+    reason: &str,
+    delay_secs: i32,
+    timeout_secs: u64,
+) -> Vec<(String, Result<String, String>)> {
     use futures::future::join_all;
 
     let reason = reason.to_string();
     let tasks: Vec<_> = targets
         .iter()
         .map(|(ip, port)| {
-            let client = AgentClient::new(ip, *port);
+            let client = AgentClient::with_timeout(ip, *port, timeout_secs);
             let reason = reason.clone();
             async move { (ip.clone(), client.shutdown(&reason, delay_secs).await) }
         })

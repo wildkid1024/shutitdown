@@ -32,6 +32,8 @@ struct Machine {
     tag: Option<String>,
     /// Agent gRPC 端口，默认 50051
     agent_port: Option<u16>,
+    /// 该节点 gRPC 请求超时秒数，默认 30
+    agent_timeout: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +41,8 @@ struct Config {
     machines: Vec<Machine>,
     #[allow(dead_code)]
     interval: Option<u64>,
+    /// gRPC 请求超时秒数，默认 30
+    timeout_secs: Option<u64>,
 }
 
 // ==================== 从 protobuf 转换的节点信息 ====================
@@ -142,8 +146,10 @@ fn collect_via_grpc(m: &Machine) -> NodeInfo {
     let node_tag = tag.clone();
     let node_ip = m.ip.clone();
 
+    let timeout = m.agent_timeout.unwrap_or(30);
+
     get_runtime().block_on(async {
-        let client = AgentClient::new(&node_ip, port);
+        let client = AgentClient::with_timeout(&node_ip, port, timeout);
 
         let info = match client.get_node_info().await {
             Ok(pb) => {

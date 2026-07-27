@@ -4,7 +4,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status};
@@ -131,67 +131,48 @@ impl NodeAgentService {
         }
     }
 
-    /// 采集 GPU 信息
-    fn collect_gpus() -> Vec<GpuInfo> {
-        // 优先 nvidia-smi
-        if let Ok((code, out, _)) = Self::run_command(
-            "nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null || echo 'N/A'"
-        ) {
-            if code == 0 && out != "N/A" {
-                return out
-                    .lines()
-                    .filter(|l| !l.is_empty())
-                    .map(|l| {
-                        let parts: Vec<&str> = l.split(',').map(|s| s.trim()).collect();
-                        GpuInfo {
-                            index: parts.first().unwrap_or(&"").to_string(),
-                            model: parts.get(1).unwrap_or(&"").to_string(),
-                            mem_used: parts.get(2).unwrap_or(&"").to_string(),
-                            mem_total: parts.get(3).unwrap_or(&"").to_string(),
-                            compute_util_pct: parts.get(4).unwrap_or(&"").to_string(),
-                            ..Default::default()
-                        }
-                    })
-                    .collect();
-            }
+    /// DEBUG 日志（环境变量 NODE_AGENT_DEBUG=1 启用）
+    fn debug_log(msg: String) {
+        if std::env::var("NODE_AGENT_DEBUG").as_deref() == Ok("1") {
+            eprintln!("[DEBUG {}] {}", Local::now().format("%H:%M:%S%.3f"), msg);
         }
-
-        vec![]
     }
 
-    /// 采集磁盘信息
-    fn collect_disks() -> Vec<DiskInfo> {
-        if let Ok((code, out, _)) = Self::run_command(
-            "df -h 2>/dev/null | awk 'NR>1 {printf \"%s,%s,%s,%s,%s\\n\", $6,$2,$3,$4,$5}' || echo 'N/A'"
-        ) {
-            if code == 0 && out != "N/A" {
-                return out
-                    .lines()
-                    .filter(|l| !l.is_empty())
-                    .map(|l| {
-                        let parts: Vec<&str> = l.split(',').collect();
-                        DiskInfo {
-                            mount: parts.first().unwrap_or(&"").to_string(),
-                            total: parts.get(1).unwrap_or(&"").to_string(),
-                            used: parts.get(2).unwrap_or(&"").to_string(),
-                            avail: parts.get(3).unwrap_or(&"").to_string(),
-                            usage_pct: parts.get(4).unwrap_or(&"0%").to_string(),
-                        }
-                    })
-                    .collect();
-            }
-        }
-        vec![]
+    /// 带耗时统计的 run_command（仅在 DEBUG 模式下额外记录）
+    fn run_command_debug(label: &str, cmd: &str) -> Result<(i32, String, String), String> {
+        let start = Instant::now();
+        let result = Self::run_command(cmd);
+        let elapsed = start.elapsed();
+        Self::debug_log(format!("[{:6}ms] {} => {:?}", elapsed.as_millis(), label, result.as_ref().map(|(c, _, _)| c).ok()));
+        result
     }
 
     /// 采集节点完整信息
     fn collect_node_info() -> NodeInfo {
+        let _t0 = Instant::now();
+
         let hostname = Self::read_line("/proc/sys/kernel/hostname");
+        Self::debug_log(format!("hostname: {}", hostname));
+
+        let _t = Instant::now();
         let (cpu_model, cpu_cores) = Self::collect_cpu();
+        Self::debug_log(format!("collect_cpu: {}ms", _t.elapsed().as_millis()));
+
+        let _t = Instant::now();
         let cpu_arch = Self::read_line("/proc/sys/kernel/arch");
+        Self::debug_log(format!("cpu_arch: {}ms", _t.elapsed().as_millis()));
+
+        let _t = Instant::now();
         let memory = Self::collect_memory();
-        let gpus = Self::collect_gpus();
-        let disks = Self::collect_disks();
+        Self::debug_log(format!("collect_memory: {}ms", _t.elapsed().as_millis()));
+
+        let _t = Instant::now();
+        let gpus = Self::collect_gpus_debug();
+        Self::debug_log(format!("collect_gpus: {}ms, count={}", _t.elapsed().as_millis(), gpus.len()));
+
+        let _t = Instant::now();
+        let disks = Self::collect_disks_debug();
+        Self::debug_log(format!("collect_disks: {}ms, count={}", _t.elapsed().as_millis(), disks.len()));
 
         let (uptime, _load_avg) = Self::read_line("/proc/uptime")
             .split_whitespace()
@@ -211,7 +192,7 @@ impl NodeAgentService {
             .collect::<Vec<_>>()
             .join(" ");
 
-        NodeInfo {
+        let info = NodeInfo {
             hostname,
             os: Self::read_line("/etc/os-release")
                 .lines()
@@ -232,7 +213,122 @@ impl NodeAgentService {
                 .next()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
+        };
+
+        Self::debug_log(format!("collect_node_info 总计: {}ms", _t0.elapsed().as_millis()));
+        info
+    }
+
+    /// 带 DEBUG 的 GPU 采集
+    fn collect_gpus_debug() -> Vec<GpuInfo> {
+        let _t = Instant::now();
+
+        // 1) nvidia-smi
+        let result = Self::run_command_debug("nvidia-smi",
+            "nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null || echo 'N/A'"
+        );
+        if let Ok((code, ref out, _)) = result {
+            if code == 0 && out != "N/A" && !out.is_empty() {
+                Self::debug_log(format!("nvidia-smi 成功 ({}ms), 输出行数={}", _t.elapsed().as_millis(), out.lines().count()));
+                return out
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| {
+                        let parts: Vec<&str> = l.split(',').map(|s| s.trim()).collect();
+                        GpuInfo {
+                            index: parts.first().unwrap_or(&"").to_string(),
+                            model: parts.get(1).unwrap_or(&"").to_string(),
+                            mem_used: parts.get(2).unwrap_or(&"").to_string(),
+                            mem_total: parts.get(3).unwrap_or(&"").to_string(),
+                            compute_util_pct: parts.get(4).unwrap_or(&"").to_string(),
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+            }
         }
+        Self::debug_log(format!("nvidia-smi 不可用 ({:?}, {}ms)", result.as_ref().map(|(c, o, _)| (c, o.len())), _t.elapsed().as_millis()));
+
+        // 2) npu-smi（使用 bash 执行，兼容 for ((..)) 语法）
+        let _t = Instant::now();
+        let check = Self::run_command_debug("npu-smi check",
+            "command -v npu-smi 2>/dev/null || echo 'N/A'"
+        );
+        if let Ok((code, ref out, _)) = check {
+            if code == 0 && out != "N/A" && !out.is_empty() {
+                // 改用 bash 执行（支持 seq 和 POSIX 语法）
+                let script = r###"
+list=$(npu-smi info -l 2>/dev/null | sed -n 's/Total Count[[:space:]]*:[[:space:]]*//p' | xargs)
+[ -z "$list" ] || [ "$list" -eq 0 ] && exit 0
+i=0
+while [ "$i" -lt "$list" ]; do
+  dev_name=$(npu-smi info -t board -i $i 2>/dev/null | sed -n 's/.*Product Name[[:space:]]*:[[:space:]]*//p' | xargs)
+  usage_info=$(npu-smi info -t usages -i $i 2>/dev/null)
+  hbm_cap=$(echo "$usage_info" | sed -n 's/.*HBM Capacity(MB)[[:space:]]*:[[:space:]]*//p' | awk '{print $1}')
+  hbm_pct=$(echo "$usage_info" | sed -n '/HBM Usage Rate/ {/Bandwidth/!p}' | sed 's/.*:[[:space:]]*//' | sed 's/%//' | xargs)
+  compute_util=$(echo "$usage_info" | sed -n 's/.*Aicore Usage Rate[[:space:]]*:[[:space:]]*//p' | xargs)
+  if [ -n "$hbm_cap" ] && [ -n "$hbm_pct" ]; then mem_used_mb=$((hbm_cap * hbm_pct / 100)); else mem_used_mb=0; fi
+  echo "$i, Ascend ${dev_name:-N/A}, ${mem_used_mb:-0}, ${hbm_cap:-0}, ${hbm_pct:-0}, ${compute_util:-0}"
+  i=$((i + 1))
+done
+"###;
+                let result = Self::run_command_debug("npu-smi query", script);
+                if let Ok((code2, ref npu_out, _)) = result {
+                    if code2 == 0 && !npu_out.is_empty() {
+                        Self::debug_log(format!("npu-smi 成功 ({}ms), 输出行数={}", _t.elapsed().as_millis(), npu_out.lines().count()));
+                        return npu_out
+                            .lines()
+                            .filter(|l| !l.is_empty())
+                            .map(|l| {
+                                let parts: Vec<&str> = l.split(',').map(|s| s.trim()).collect();
+                                GpuInfo {
+                                    index: parts.first().unwrap_or(&"").to_string(),
+                                    model: parts.get(1).unwrap_or(&"").to_string(),
+                                    mem_used: parts.get(2).unwrap_or(&"").to_string(),
+                                    mem_total: parts.get(3).unwrap_or(&"").to_string(),
+                                    mem_util_pct: parts.get(4).unwrap_or(&"").to_string(),
+                                    compute_util_pct: parts.get(5).unwrap_or(&"").to_string(),
+                                    ..Default::default()
+                                }
+                            })
+                            .collect();
+                    }
+                }
+                Self::debug_log(format!("npu-smi 无输出 ({:?}, {}ms)", result.as_ref().map(|(c, o, _)| (c, o.len())), _t.elapsed().as_millis()));
+            }
+        }
+
+        vec![]
+    }
+
+    /// 带 DEBUG 的磁盘采集
+    fn collect_disks_debug() -> Vec<DiskInfo> {
+        let _t = Instant::now();
+        let result = Self::run_command_debug("df -h",
+            "df -h 2>/dev/null | awk 'NR>1 {printf \"%s,%s,%s,%s,%s\\n\", $6,$2,$3,$4,$5}' || echo 'N/A'"
+        );
+        if let Ok((code, ref out, _)) = result {
+            if code == 0 && out != "N/A" {
+                let disks: Vec<DiskInfo> = out
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| {
+                        let parts: Vec<&str> = l.split(',').collect();
+                        DiskInfo {
+                            mount: parts.first().unwrap_or(&"").to_string(),
+                            total: parts.get(1).unwrap_or(&"").to_string(),
+                            used: parts.get(2).unwrap_or(&"").to_string(),
+                            avail: parts.get(3).unwrap_or(&"").to_string(),
+                            usage_pct: parts.get(4).unwrap_or(&"0%").to_string(),
+                        }
+                    })
+                    .collect();
+                Self::debug_log(format!("df -h 成功 ({}ms), {} 个分区", _t.elapsed().as_millis(), disks.len()));
+                return disks;
+            }
+        }
+        Self::debug_log(format!("df -h 失败 ({}ms)", _t.elapsed().as_millis()));
+        vec![]
     }
 }
 
@@ -335,7 +431,7 @@ impl NodeAgent for NodeAgentService {
                 interval.tick().await;
 
                 // 检查磁盘使用率
-                let infos = NodeAgentService::collect_disks();
+                let infos = NodeAgentService::collect_disks_debug();
                 for disk in &infos {
                     let pct = disk.usage_pct.trim_end_matches('%').parse::<f64>().unwrap_or(0.0);
                     if pct > 90.0 {
