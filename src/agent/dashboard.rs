@@ -442,7 +442,7 @@ fn render_overview(f: &mut Frame, area: Rect, app: &App) {
             .iter()
             .enumerate()
             .map(|(i, n)| {
-                let disk_usage = n.disks.first().map(|d| d.usage_pct.as_str()).unwrap_or("N/A");
+                let disk_usage = n.disks.iter().find(|d| d.mount == "/").or_else(|| n.disks.first()).map(|d| d.usage_pct.as_str()).unwrap_or("N/A");
                 let mem_text = format!("{}/{}", n.memory.used, n.memory.total);
                 let gpu_text = if n.gpus.is_empty() { "N/A".into() } else { format!("{}卡", n.gpus.len()) };
                 let is_selected = start + i == app.selected_row;

@@ -225,24 +225,38 @@ impl NodeAgentService {
 
         // 1) nvidia-smi
         let result = Self::run_command_debug("nvidia-smi",
-            "nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null || echo 'N/A'"
+            "nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null"
         );
         if let Ok((code, ref out, _)) = result {
-            if code == 0 && out != "N/A" && !out.is_empty() {
+            if code == 0 && !out.is_empty() {
                 Self::debug_log(format!("nvidia-smi 成功 ({}ms), 输出行数={}", _t.elapsed().as_millis(), out.lines().count()));
                 return out
                     .lines()
                     .filter(|l| !l.is_empty())
-                    .map(|l| {
+                    .filter_map(|l| {
                         let parts: Vec<&str> = l.split(',').map(|s| s.trim()).collect();
-                        GpuInfo {
+                        let model = parts.get(1).unwrap_or(&"").trim().to_string();
+                        if model.is_empty() || model == "N/A" { return None; }
+                        let parse_mem = |s: &str| -> Option<f64> {
+                            let s = s.trim();
+                            if let Ok(v) = s.parse::<f64>() { return Some(v); }
+                            s.split_whitespace().next().and_then(|n| n.parse::<f64>().ok())
+                        };
+                        let mem_used = parts.get(2).unwrap_or(&"").to_string();
+                        let mem_total = parts.get(3).unwrap_or(&"").to_string();
+                        let mem_util = match (parse_mem(&mem_used), parse_mem(&mem_total)) {
+                            (Some(u), Some(t)) if t > 0.0 => format!("{:.0}", u / t * 100.0),
+                            _ => "N/A".into(),
+                        };
+                        Some(GpuInfo {
                             index: parts.first().unwrap_or(&"").to_string(),
-                            model: parts.get(1).unwrap_or(&"").to_string(),
-                            mem_used: parts.get(2).unwrap_or(&"").to_string(),
-                            mem_total: parts.get(3).unwrap_or(&"").to_string(),
+                            model,
+                            mem_used,
+                            mem_total,
+                            mem_util_pct: mem_util,
                             compute_util_pct: parts.get(4).unwrap_or(&"").to_string(),
                             ..Default::default()
-                        }
+                        })
                     })
                     .collect();
             }
@@ -295,6 +309,71 @@ done
                     }
                 }
                 Self::debug_log(format!("npu-smi 无输出 ({:?}, {}ms)", result.as_ref().map(|(c, o, _)| (c, o.len())), _t.elapsed().as_millis()));
+            }
+        }
+
+        // 3) rocm-smi（Hygon 海光 DCU）
+        let result = Self::run_command_debug("rocm-smi",
+            "rocm-smi --showmeminfo vram 2>/dev/null | awk -F': ' '
+    /vram Total Memory \\(MiB\\)/ { idx=$1; gsub(/[^0-9]/,\"\",idx); total=$NF; gsub(/[^0-9]/,\"\",total) }
+    /vram Total Used Memory \\(MiB\\)/ { used=$NF; gsub(/[^0-9]/,\"\",used) }
+    total != \"\" && used != \"\" { printf \"%s,Radeon,%s,%s,0\\n\", idx, used, total; total=\"\"; used=\"\" }' 2>/dev/null"
+        );
+        if let Ok((code, ref out, _)) = result {
+            if code == 0 && !out.is_empty() {
+                let gpus: Vec<GpuInfo> = out
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| {
+                        let parts: Vec<&str> = l.split(',').map(|s| s.trim()).collect();
+                        let mem_used = parts.get(2).unwrap_or(&"").to_string();
+                        let mem_total = parts.get(3).unwrap_or(&"").to_string();
+                        let parse_mem = |s: &str| -> Option<f64> {
+                            let s = s.trim();
+                            if let Ok(v) = s.parse::<f64>() { return Some(v); }
+                            s.split_whitespace().next().and_then(|n| n.parse::<f64>().ok())
+                        };
+                        let mem_util = match (parse_mem(&mem_used), parse_mem(&mem_total)) {
+                            (Some(u), Some(t)) if t > 0.0 => format!("{:.0}", u / t * 100.0),
+                            _ => "N/A".into(),
+                        };
+                        GpuInfo {
+                            index: parts.first().unwrap_or(&"").to_string(),
+                            model: parts.get(1).unwrap_or(&"").to_string(),
+                            mem_used,
+                            mem_total,
+                            mem_util_pct: mem_util,
+                            compute_util_pct: parts.get(4).unwrap_or(&"").to_string(),
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+                if !gpus.is_empty() {
+                    Self::debug_log(format!("rocm-smi 成功 ({}ms), GPU数={}", _t.elapsed().as_millis(), gpus.len()));
+                    return gpus;
+                }
+            }
+        }
+
+        // 4) lspci 兜底（仅识别型号和数量）
+        let result = Self::run_command_debug("lspci",
+            "lspci 2>/dev/null | grep -iE '3D|VGA|Display' | head -5 | sed 's/.*: //' || echo 'N/A'"
+        );
+        if let Ok((code, ref out, _)) = result {
+            if code == 0 && out != "N/A" && !out.is_empty() {
+                let gpus: Vec<GpuInfo> = out
+                    .lines()
+                    .enumerate()
+                    .map(|(i, line)| GpuInfo {
+                        index: i.to_string(),
+                        model: format!("其他 ({})", line.trim()),
+                        ..Default::default()
+                    })
+                    .collect();
+                if !gpus.is_empty() {
+                    Self::debug_log(format!("lspci 成功 ({}ms), GPU数={}", _t.elapsed().as_millis(), gpus.len()));
+                    return gpus;
+                }
             }
         }
 
