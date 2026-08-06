@@ -57,6 +57,15 @@ message NodeInfo {
   string load_avg = 10;
   string agent_version = 11;
   int64 uptime_seconds = 12;
+  repeated ContainerInfo containers = 13;
+}
+
+message ContainerInfo {
+  string container_id = 1;
+  string name = 2;
+  string image = 3;
+  string status = 4;
+  string ports = 5;
 }
 
 message MemoryInfo {

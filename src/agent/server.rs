@@ -147,6 +147,80 @@ impl NodeAgentService {
         result
     }
 
+    /// 通过 curl --unix-socket 采集容器列表
+    fn collect_containers() -> Vec<ContainerInfo> {
+        let socket_path = "/var/run/docker.sock";
+        if !std::path::Path::new(socket_path).exists() {
+            Self::debug_log("collect_containers: docker.sock 不存在".into());
+            return vec![];
+        }
+
+        let _t = Instant::now();
+
+        let result = (|| -> Result<Vec<ContainerInfo>, String> {
+            let output = Command::new("curl")
+                .args([
+                    "-s",
+                    "--unix-socket", socket_path,
+                    "http://localhost/containers/json?all=true",
+                ])
+                .output()
+                .map_err(|e| format!("curl 执行失败: {}", e))?;
+
+            if !output.status.success() {
+                return Err(format!("curl 退出码: {:?}, stderr: {}", output.status.code(), String::from_utf8_lossy(&output.stderr)));
+            }
+
+            let body = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if body.is_empty() || body == "null" {
+                return Ok(vec![]);
+            }
+
+            let containers: Vec<serde_json::Value> = serde_json::from_str(&body)
+                .map_err(|e| format!("JSON 解析失败: {}", e))?;
+
+            let result: Vec<ContainerInfo> = containers.iter().filter_map(|c| {
+                let container_id = c.get("Id")?.as_str()?.chars().take(12).collect::<String>();
+                Some(ContainerInfo {
+                    container_id,
+                    name: c.get("Names")?.as_array()?.first()?.as_str()?.trim_start_matches('/').to_string(),
+                    image: c.get("Image")?.as_str()?.to_string(),
+                    status: c.get("State")?.as_str()?.to_string(),
+                    ports: Self::format_docker_ports(c.get("Ports")?.as_array()),
+                })
+            }).collect();
+
+            Self::debug_log(format!("collect_containers via curl: {}ms, count={}", _t.elapsed().as_millis(), result.len()));
+            Ok(result)
+        })();
+
+        match result {
+            Ok(containers) => containers,
+            Err(e) => {
+                Self::debug_log(format!("collect_containers 失败: {}", e));
+                vec![]
+            }
+        }
+    }
+
+    /// 格式化 Docker 端口映射
+    fn format_docker_ports(ports: Option<&Vec<serde_json::Value>>) -> String {
+        let ports = match ports {
+            Some(p) if !p.is_empty() => p,
+            _ => return String::new(),
+        };
+        ports.iter().filter_map(|p| {
+            let priv_p = p.get("PrivatePort")?.as_u64()?;
+            let typ = p.get("Type")?.as_str().unwrap_or("tcp");
+            if let Some(pub_p) = p.get("PublicPort") {
+                let pub_p = pub_p.as_u64()?;
+                Some(format!("{}:{}/{}", priv_p, pub_p, typ))
+            } else {
+                Some(format!("{}/{}", priv_p, typ))
+            }
+        }).collect::<Vec<_>>().join(", ")
+    }
+
     /// 采集节点完整信息
     fn collect_node_info() -> NodeInfo {
         let _t0 = Instant::now();
@@ -169,6 +243,10 @@ impl NodeAgentService {
         let _t = Instant::now();
         let gpus = Self::collect_gpus_debug();
         Self::debug_log(format!("collect_gpus: {}ms, count={}", _t.elapsed().as_millis(), gpus.len()));
+
+        let _t = Instant::now();
+        let containers = Self::collect_containers();
+        Self::debug_log(format!("collect_containers: {}ms, count={}", _t.elapsed().as_millis(), containers.len()));
 
         let _t = Instant::now();
         let disks = Self::collect_disks_debug();
@@ -204,6 +282,7 @@ impl NodeAgentService {
             cpu_arch,
             memory: Some(memory),
             gpus,
+            containers,
             disks,
             uptime,
             load_avg: load,
@@ -280,7 +359,7 @@ while [ "$i" -lt "$list" ]; do
   usage_info=$(npu-smi info -t usages -i $i 2>/dev/null)
   hbm_cap=$(echo "$usage_info" | sed -n 's/.*HBM Capacity(MB)[[:space:]]*:[[:space:]]*//p' | awk '{print $1}')
   hbm_pct=$(echo "$usage_info" | sed -n '/HBM Usage Rate/ {/Bandwidth/!p}' | sed 's/.*:[[:space:]]*//' | sed 's/%//' | xargs)
-  compute_util=$(echo "$usage_info" | sed -n 's/.*Aicore Usage Rate[[:space:]]*:[[:space:]]*//p' | xargs)
+  compute_util=$(echo "$usage_info" | grep 'Aicore Usage Rate' | awk -F':[[:space:]]*' '{print $2}' | xargs)
   if [ -n "$hbm_cap" ] && [ -n "$hbm_pct" ]; then mem_used_mb=$((hbm_cap * hbm_pct / 100)); else mem_used_mb=0; fi
   echo "$i, Ascend ${dev_name:-N/A}, ${mem_used_mb:-0}, ${hbm_cap:-0}, ${hbm_pct:-0}, ${compute_util:-0}"
   i=$((i + 1))

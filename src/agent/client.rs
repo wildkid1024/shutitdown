@@ -125,11 +125,12 @@ pub fn format_node_info(info: &NodeInfo) -> String {
         .unwrap_or("N/A");
 
     format!(
-        "CPU:{} {}核 | 内存:{}/{} | GPU:{}卡 | 磁盘:{} | 负载:{} | 运行:{}",
+        "CPU:{} {}核 | 内存:{}/{} | GPU:{}卡 | 容器:{} | 磁盘:{} | 负载:{} | 运行:{}",
         info.cpu_model, info.cpu_cores,
         info.memory.as_ref().map(|m| m.used.as_str()).unwrap_or("N/A"),
         info.memory.as_ref().map(|m| m.total.as_str()).unwrap_or("N/A"),
         gpu_count,
+        info.containers.len(),
         disk_usage,
         info.load_avg,
         info.uptime,

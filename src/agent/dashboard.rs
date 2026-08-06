@@ -68,6 +68,15 @@ struct DiskInfo {
 }
 
 #[derive(Debug, Clone, Default)]
+struct ContainerInfo {
+    container_id: String,
+    name: String,
+    image: String,
+    status: String,
+    ports: String,
+}
+
+#[derive(Debug, Clone, Default)]
 struct CpuDetail {
     model: String,
     cores: i32,
@@ -92,6 +101,7 @@ struct NodeInfo {
     memory: MemDetail,
     gpus: Vec<GpuInfo>,
     disks: Vec<DiskInfo>,
+    containers: Vec<ContainerInfo>,
     uptime: String,
     load_avg: String,
     agent_version: String,
@@ -110,6 +120,7 @@ impl Default for NodeInfo {
             memory: MemDetail::default(),
             gpus: vec![],
             disks: vec![],
+            containers: vec![],
             uptime: String::new(),
             load_avg: String::new(),
             agent_version: String::new(),
@@ -179,6 +190,18 @@ fn collect_via_grpc(m: &Machine) -> NodeInfo {
                     })
                     .collect();
 
+                let containers = pb
+                    .containers
+                    .iter()
+                    .map(|c| ContainerInfo {
+                        container_id: c.container_id.clone(),
+                        name: c.name.clone(),
+                        image: c.image.clone(),
+                        status: c.status.clone(),
+                        ports: c.ports.clone(),
+                    })
+                    .collect();
+
                 let mem = pb.memory.unwrap_or_default();
 
                 NodeInfo {
@@ -199,6 +222,7 @@ fn collect_via_grpc(m: &Machine) -> NodeInfo {
                     },
                     gpus,
                     disks,
+                    containers,
                     uptime: pb.uptime,
                     load_avg: pb.load_avg,
                     agent_version: pb.agent_version,
@@ -219,7 +243,7 @@ fn collect_via_grpc(m: &Machine) -> NodeInfo {
 
 // ==================== TUI 应用 ====================
 
-const TAB_NAMES: &[&str] = &["总览", "CPU", "内存", "显卡", "磁盘"];
+const TAB_NAMES: &[&str] = &["总览", "CPU", "内存", "显卡", "磁盘", "容器"];
 
 struct App {
     nodes: Vec<NodeInfo>,
@@ -257,6 +281,7 @@ impl App {
                 }
                 n
             }
+            5 => self.nodes.iter().map(|n| n.containers.len()).sum(),
             _ => 0,
         }
     }
@@ -284,6 +309,7 @@ impl App {
         let name = match self.current_tab {
             3 => self.node_name_at_gpu_row(self.selected_row),
             4 => self.node_name_at_disk_row(self.selected_row),
+            5 => self.node_name_at_container_row(self.selected_row),
             _ => None,
         };
         if let Some(name) = name {
@@ -324,6 +350,26 @@ impl App {
             r += 1;
             if !self.collapsed_nodes.contains(&node.name) {
                 r += node.disks.len();
+                if r > row {
+                    return Some(node.name.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn node_name_at_container_row(&self, row: usize) -> Option<String> {
+        let mut r = 0;
+        for node in &self.nodes {
+            if node.containers.is_empty() {
+                continue;
+            }
+            if r == row {
+                return Some(node.name.clone());
+            }
+            r += 1;
+            if !self.collapsed_nodes.contains(&node.name) {
+                r += node.containers.len();
                 if r > row {
                     return Some(node.name.clone());
                 }
@@ -379,6 +425,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         2 => render_memory(f, chunks[1], app),
         3 => render_gpu(f, chunks[1], app),
         4 => render_disk(f, chunks[1], app),
+        5 => render_containers(f, chunks[1], app),
         _ => {}
     }
 
@@ -407,7 +454,8 @@ fn render_overview(f: &mut Frame, area: Rect, app: &App) {
     let online = app.nodes.iter().filter(|n| n.online).count();
     let offline = total - online;
     let gpu_total: usize = app.nodes.iter().map(|n| n.gpus.len()).sum();
-    let summary = format!("总计 {} 节点 | 在线 {} | 离线 {} | GPU 总数 {}", total, online, offline, gpu_total);
+    let container_total: usize = app.nodes.iter().map(|n| n.containers.len()).sum();
+    let summary = format!("总计 {} 节点 | 在线 {} | 离线 {} | GPU 总数 {} | 容器总数 {}", total, online, offline, gpu_total, container_total);
 
     f.render_widget(
         Paragraph::new(summary)
@@ -416,7 +464,7 @@ fn render_overview(f: &mut Frame, area: Rect, app: &App) {
         area,
     );
 
-    let headers = vec!["名称", "标签", "状态", "IP", "Agent版", "CPU", "GPU", "内存", "磁盘", "运行时间"];
+    let headers = vec!["名称", "标签", "状态", "IP", "Agent版", "CPU", "GPU", "容器", "内存", "磁盘", "运行时间"];
     let widths = [
         Constraint::Length(14),
         Constraint::Length(8),
@@ -424,7 +472,8 @@ fn render_overview(f: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(15),
         Constraint::Length(8),
         Constraint::Length(8),
-        Constraint::Length(16),
+        Constraint::Length(10),
+        Constraint::Length(8),
         Constraint::Length(16),
         Constraint::Length(12),
         Constraint::Length(18),
@@ -459,6 +508,7 @@ fn render_overview(f: &mut Frame, area: Rect, app: &App) {
                     Cell::from(n.agent_version.as_str()),
                     Cell::from(format!("{}核", n.cpu.cores)),
                     Cell::from(gpu_text),
+                    Cell::from(n.containers.len().to_string()),
                     Cell::from(mem_text),
                     Cell::from(disk_usage),
                     Cell::from(n.uptime.as_str()),
@@ -753,6 +803,91 @@ fn render_disk(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn render_containers(f: &mut Frame, area: Rect, app: &App) {
+    let headers = vec!["节点", "容器ID", "名称", "镜像", "状态", "端口"];
+    let widths = [
+        Constraint::Length(14),
+        Constraint::Length(14),
+        Constraint::Length(20),
+        Constraint::Length(30),
+        Constraint::Length(10),
+        Constraint::Length(30),
+    ];
+
+    let header_cells = headers
+        .iter()
+        .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
+    let header_row = Row::new(header_cells).style(Style::default().bg(Color::DarkGray));
+
+    let mut rows = Vec::new();
+    let mut row_idx = 0usize;
+    for n in &app.nodes {
+        if n.containers.is_empty() {
+            continue;
+        }
+        let collapsed = app.collapsed_nodes.contains(&n.name);
+        let count = n.containers.len();
+        let summary = if collapsed {
+            format!(" ▶ {} ({}容器)", n.name, count)
+        } else {
+            format!(" ▼ {} ({}容器)", n.name, count)
+        };
+        let is_selected = row_idx == app.selected_row;
+        let summary_style = if is_selected {
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)
+        };
+        rows.push(
+            Row::new(vec![
+                Cell::from(Span::styled(summary, summary_style)),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+            ])
+            .style(if is_selected { Style::default().bg(Color::Blue) } else { Style::default() }),
+        );
+        row_idx += 1;
+
+        if !collapsed {
+            for c in &n.containers {
+                let is_selected = row_idx == app.selected_row;
+                let row_style = if is_selected {
+                    Style::default().bg(Color::Blue).fg(Color::White)
+                } else {
+                    Style::default()
+                };
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(""),
+                        Cell::from(c.container_id.as_str()),
+                        Cell::from(c.name.as_str()),
+                        Cell::from(c.image.as_str()),
+                        Cell::from(c.status.as_str()),
+                        Cell::from(c.ports.as_str()),
+                    ])
+                    .style(row_style),
+                );
+                row_idx += 1;
+            }
+        }
+    }
+
+    let start = app.scroll_offset;
+    let visible_rows: Vec<Row> = rows.into_iter().skip(start).take(100).collect();
+    f.render_widget(
+        Table::new(visible_rows, &widths)
+            .header(header_row)
+            .block(Block::default().borders(Borders::ALL).title(" 容器信息（Enter/Space 折叠/展开节点） ")),
+        area,
+    );
+}
+
 // ==================== 主入口 ====================
 
 pub fn run_dashboard() {
@@ -793,7 +928,7 @@ pub fn run_dashboard() {
     let mut log = format!("===== 节点信息采集 (gRPC) [{}] =====\n", now);
     for n in &nodes {
         log.push_str(&format!(
-            "{} | {} | {} | CPU:{} {}核 内存:{}/{} GPU:{} 磁盘:{} | 状态:{}\n",
+            "{} | {} | {} | CPU:{} {}核 内存:{}/{} GPU:{} 磁盘:{} 容器:{} | 状态:{}\n",
             n.name,
             n.tag,
             n.ip,
@@ -803,6 +938,7 @@ pub fn run_dashboard() {
             n.memory.total,
             n.gpus.len(),
             n.disks.first().map(|d| d.usage_pct.as_str()).unwrap_or("N/A"),
+            n.containers.len(),
             n.status_str(),
         ));
     }
@@ -827,10 +963,11 @@ fn collect_all(machines: &[Machine], silent: bool) -> Vec<NodeInfo> {
         if !silent {
             if info.online {
                 println!(
-                    "已获取 (CPU:{}核 GPU:{} 磁盘:{})",
+                    "已获取 (CPU:{}核 GPU:{} 磁盘:{} 容器:{})",
                     info.cpu.cores,
                     info.gpus.len(),
-                    info.disks.len()
+                    info.disks.len(),
+                    info.containers.len(),
                 );
             } else {
                 println!("离线/失败");
