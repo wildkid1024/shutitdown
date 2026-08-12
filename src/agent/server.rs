@@ -221,6 +221,21 @@ impl NodeAgentService {
         }).collect::<Vec<_>>().join(", ")
     }
 
+    /// 通过 curl --unix-socket 调用 Docker API
+    fn docker_api_call(method: &str, endpoint: &str) -> Result<(i32, String, String), String> {
+        let socket_path = "/var/run/docker.sock";
+        if !std::path::Path::new(socket_path).exists() {
+            return Err("docker.sock 不存在".into());
+        }
+        // curl -s -w %{http_code} -o /dev/null -X POST --unix-socket ... 'http://localhost/...'
+        let method_flag = if method.is_empty() { String::new() } else { format!("-X {}", method) };
+        let cmd = format!(
+            "curl -s -o /dev/null -w '%{{http_code}}' {} --unix-socket {} 'http://localhost{}'",
+            method_flag, socket_path, endpoint
+        );
+        Self::run_command(&cmd)
+    }
+
     /// 采集节点完整信息
     fn collect_node_info() -> NodeInfo {
         let _t0 = Instant::now();
@@ -570,6 +585,62 @@ impl NodeAgent for NodeAgentService {
             Err(e) => Ok(Response::new(ShutdownResponse {
                 scheduled: false,
                 message: format!("关机指令下发失败: {}", e),
+            })),
+        }
+    }
+
+    async fn docker_start(
+        &self,
+        request: Request<DockerContainerRequest>,
+    ) -> Result<Response<DockerContainerResponse>, Status> {
+        let container_id = request.into_inner().container_id;
+        let endpoint = format!("/containers/{}/start", container_id);
+        match Self::docker_api_call("POST", &endpoint) {
+            Ok((_code, ref http_code, _)) => {
+                let http = http_code.trim();
+                if http == "204" || http == "304" {
+                    Ok(Response::new(DockerContainerResponse {
+                        success: true,
+                        message: format!("容器 {} 已启动", container_id),
+                    }))
+                } else {
+                    Ok(Response::new(DockerContainerResponse {
+                        success: false,
+                        message: format!("启动失败, HTTP {}", http),
+                    }))
+                }
+            }
+            Err(e) => Ok(Response::new(DockerContainerResponse {
+                success: false,
+                message: e,
+            })),
+        }
+    }
+
+    async fn docker_stop(
+        &self,
+        request: Request<DockerContainerRequest>,
+    ) -> Result<Response<DockerContainerResponse>, Status> {
+        let container_id = request.into_inner().container_id;
+        let endpoint = format!("/containers/{}/stop", container_id);
+        match Self::docker_api_call("POST", &endpoint) {
+            Ok((_code, ref http_code, _)) => {
+                let http = http_code.trim();
+                if http == "204" || http == "304" {
+                    Ok(Response::new(DockerContainerResponse {
+                        success: true,
+                        message: format!("容器 {} 已停止", container_id),
+                    }))
+                } else {
+                    Ok(Response::new(DockerContainerResponse {
+                        success: false,
+                        message: format!("停止失败, HTTP {}", http),
+                    }))
+                }
+            }
+            Err(e) => Ok(Response::new(DockerContainerResponse {
+                success: false,
+                message: e,
             })),
         }
     }

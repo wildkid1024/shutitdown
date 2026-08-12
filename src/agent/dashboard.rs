@@ -21,7 +21,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use crate::client::{self, AgentClient};
+use crate::client::AgentClient;
 
 // ==================== 配置模型 ====================
 
@@ -377,6 +377,27 @@ impl App {
         }
         None
     }
+
+    /// 获取选中行的容器信息 (节点 index, 容器引用)
+    fn container_at_row(&self, row: usize) -> Option<(usize, &ContainerInfo)> {
+        let mut r = 0;
+        for (ni, node) in self.nodes.iter().enumerate() {
+            if node.containers.is_empty() {
+                continue;
+            }
+            // skip summary row
+            r += 1;
+            if !self.collapsed_nodes.contains(&node.name) {
+                for c in &node.containers {
+                    if r == row {
+                        return Some((ni, c));
+                    }
+                    r += 1;
+                }
+            }
+        }
+        None
+    }
 }
 
 fn text_bar(pct: f64, width: u16) -> String {
@@ -433,6 +454,8 @@ fn ui(f: &mut Frame, app: &mut App) {
         Span::styled(" ←→切换Tab ", Style::default().fg(Color::Cyan)),
         Span::styled(" ↑↓滚动 ", Style::default().fg(Color::Cyan)),
         Span::styled(" Enter/Space折叠/展开 ", Style::default().fg(Color::Yellow)),
+        Span::styled(" s启动容器 ", Style::default().fg(Color::Green)),
+        Span::styled(" t停止容器 ", Style::default().fg(Color::Red)),
         Span::styled(" q退出 ", Style::default().fg(Color::Cyan)),
         Span::styled(" r刷新 ", Style::default().fg(Color::Green)),
     ]);
@@ -1041,6 +1064,46 @@ fn start_tui(nodes: Vec<NodeInfo>, config: Config, refresh_interval: u64) {
                     KeyCode::Down | KeyCode::Char('j') => app.select_next(),
                     KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
                     KeyCode::Enter | KeyCode::Char(' ') => app.toggle_selected_node(),
+                    KeyCode::Char('s') if app.current_tab == 5 => {
+                        // 启动容器
+                        if let Some((ni, c)) = app.container_at_row(app.selected_row) {
+                            let m = &app.config.machines[ni];
+                            let port = m.agent_port.unwrap_or(50051);
+                            let timeout = m.agent_timeout.unwrap_or(30);
+                            let client = AgentClient::with_timeout(&m.ip, port, timeout);
+                            let result = get_runtime().block_on(client.docker_start(&c.container_id));
+                            match result {
+                                Ok(msg) => {
+                                    app.nodes = collect_all(&app.config.machines, true);
+                                    app.last_refresh = Local::now().format("%H:%M:%S").to_string();
+                                    let _ = fs::write("/tmp/node_agent_docker_msg.txt", format!("✅ {}\n", msg));
+                                }
+                                Err(e) => {
+                                    let _ = fs::write("/tmp/node_agent_docker_msg.txt", format!("❌ {}\n", e));
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('t') if app.current_tab == 5 => {
+                        // 停止容器
+                        if let Some((ni, c)) = app.container_at_row(app.selected_row) {
+                            let m = &app.config.machines[ni];
+                            let port = m.agent_port.unwrap_or(50051);
+                            let timeout = m.agent_timeout.unwrap_or(30);
+                            let client = AgentClient::with_timeout(&m.ip, port, timeout);
+                            let result = get_runtime().block_on(client.docker_stop(&c.container_id));
+                            match result {
+                                Ok(msg) => {
+                                    app.nodes = collect_all(&app.config.machines, true);
+                                    app.last_refresh = Local::now().format("%H:%M:%S").to_string();
+                                    let _ = fs::write("/tmp/node_agent_docker_msg.txt", format!("✅ {}\n", msg));
+                                }
+                                Err(e) => {
+                                    let _ = fs::write("/tmp/node_agent_docker_msg.txt", format!("❌ {}\n", e));
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }

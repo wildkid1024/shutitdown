@@ -109,6 +109,30 @@ impl AgentClient {
         Ok(resp.into_inner().message)
     }
 
+    /// 启动 Docker 容器
+    pub async fn docker_start(&self, container_id: &str) -> Result<String, String> {
+        let mut client = self.client().map_err(|e| format!("连接失败: {}", e))?;
+        let resp = client
+            .docker_start(DockerContainerRequest {
+                container_id: container_id.to_string(),
+            })
+            .await
+            .map_err(|e| format!("Docker 启动失败: {}", e))?;
+        Ok(resp.into_inner().message)
+    }
+
+    /// 停止 Docker 容器
+    pub async fn docker_stop(&self, container_id: &str) -> Result<String, String> {
+        let mut client = self.client().map_err(|e| format!("连接失败: {}", e))?;
+        let resp = client
+            .docker_stop(DockerContainerRequest {
+                container_id: container_id.to_string(),
+            })
+            .await
+            .map_err(|e| format!("Docker 停止失败: {}", e))?;
+        Ok(resp.into_inner().message)
+    }
+
     /// 连接并采集完整信息（一个连接完成 ping + get_node_info）
     pub async fn connect_and_collect(&self) -> Result<AgentConnection, String> {
         self.ping().await
@@ -222,6 +246,64 @@ pub async fn batch_shutdown_with_timeout(
             let client = AgentClient::with_timeout(ip, *port, timeout_secs);
             let reason = reason.clone();
             async move { (ip.clone(), client.shutdown(&reason, delay_secs).await) }
+        })
+        .collect();
+
+    join_all(tasks).await
+}
+
+/// 并发批量启动容器
+pub async fn batch_docker_start(
+    targets: &[(String, u16)],
+    container_id: &str,
+) -> Vec<(String, Result<String, String>)> {
+    batch_docker_start_with_timeout(targets, container_id, 30).await
+}
+
+/// 并发批量启动容器（自定义超时）
+pub async fn batch_docker_start_with_timeout(
+    targets: &[(String, u16)],
+    container_id: &str,
+    timeout_secs: u64,
+) -> Vec<(String, Result<String, String>)> {
+    use futures::future::join_all;
+
+    let container_id = container_id.to_string();
+    let tasks: Vec<_> = targets
+        .iter()
+        .map(|(ip, port)| {
+            let client = AgentClient::with_timeout(ip, *port, timeout_secs);
+            let container_id = container_id.clone();
+            async move { (ip.clone(), client.docker_start(&container_id).await) }
+        })
+        .collect();
+
+    join_all(tasks).await
+}
+
+/// 并发批量停止容器
+pub async fn batch_docker_stop(
+    targets: &[(String, u16)],
+    container_id: &str,
+) -> Vec<(String, Result<String, String>)> {
+    batch_docker_stop_with_timeout(targets, container_id, 30).await
+}
+
+/// 并发批量停止容器（自定义超时）
+pub async fn batch_docker_stop_with_timeout(
+    targets: &[(String, u16)],
+    container_id: &str,
+    timeout_secs: u64,
+) -> Vec<(String, Result<String, String>)> {
+    use futures::future::join_all;
+
+    let container_id = container_id.to_string();
+    let tasks: Vec<_> = targets
+        .iter()
+        .map(|(ip, port)| {
+            let client = AgentClient::with_timeout(ip, *port, timeout_secs);
+            let container_id = container_id.clone();
+            async move { (ip.clone(), client.docker_stop(&container_id).await) }
         })
         .collect();
 

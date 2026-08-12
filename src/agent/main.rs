@@ -64,6 +64,24 @@ enum Commands {
         #[arg(long, short, default_value = "30")]
         timeout: i32,
     },
+    /// 启动 Docker 容器
+    DockerStart {
+        /// 目标节点, 格式 ip:port
+        #[arg(required = true, num_args = 1..)]
+        targets: Vec<String>,
+        /// 容器 ID
+        #[arg(long)]
+        container_id: String,
+    },
+    /// 停止 Docker 容器
+    DockerStop {
+        /// 目标节点, 格式 ip:port
+        #[arg(required = true, num_args = 1..)]
+        targets: Vec<String>,
+        /// 容器 ID
+        #[arg(long)]
+        container_id: String,
+    },
 }
 
 fn parse_targets(raw: &[String]) -> Vec<(String, u16)> {
@@ -173,6 +191,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Err(e) => println!("❌  {}  {}", ip, e),
+                }
+            }
+        }
+
+        Commands::DockerStart {
+            targets,
+            container_id,
+        } => {
+            let targets = parse_targets(&targets);
+            println!(
+                "向 {} 个节点下发 Docker 容器启动指令 (容器: {})...\n",
+                targets.len(),
+                container_id
+            );
+
+            let results = client::batch_docker_start_with_timeout(&targets, &container_id, global_timeout).await;
+            for (ip, result) in results {
+                match result {
+                    Ok(msg) => println!("✅  {:20}  {}", ip, msg),
+                    Err(e) => println!("❌  {:20}  {}", ip, e),
+                }
+            }
+        }
+
+        Commands::DockerStop {
+            targets,
+            container_id,
+        } => {
+            let targets = parse_targets(&targets);
+            println!(
+                "向 {} 个节点下发 Docker 容器停止指令 (容器: {})...\n",
+                targets.len(),
+                container_id
+            );
+
+            let results = client::batch_docker_stop_with_timeout(&targets, &container_id, global_timeout).await;
+            for (ip, result) in results {
+                match result {
+                    Ok(msg) => println!("✅  {:20}  {}", ip, msg),
+                    Err(e) => println!("❌  {:20}  {}", ip, e),
                 }
             }
         }

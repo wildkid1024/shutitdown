@@ -21,6 +21,12 @@ service NodeAgent {
 
   // 服务端推送事件流（状态变更、告警等）
   rpc WatchEvents(WatchRequest) returns (stream NodeEvent);
+
+  // 启动 Docker 容器
+  rpc DockerStart(DockerContainerRequest) returns (DockerContainerResponse);
+
+  // 停止 Docker 容器
+  rpc DockerStop(DockerContainerRequest) returns (DockerContainerResponse);
 }
 
 // ──────────────────────────────────────
@@ -118,6 +124,19 @@ message ShutdownRequest {
 
 message ShutdownResponse {
   bool scheduled = 1;
+  string message = 2;
+}
+
+// ──────────────────────────────────────
+// Docker 容器管理
+// ──────────────────────────────────────
+
+message DockerContainerRequest {
+  string container_id = 1;
+}
+
+message DockerContainerResponse {
+  bool success = 1;
   string message = 2;
 }
 
