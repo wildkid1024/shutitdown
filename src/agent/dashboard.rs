@@ -77,6 +77,14 @@ struct ContainerInfo {
 }
 
 #[derive(Debug, Clone, Default)]
+struct StackInfo {
+    project_name: String,
+    status: String,
+    config_files: String,
+    container_count: i32,
+}
+
+#[derive(Debug, Clone, Default)]
 struct CpuDetail {
     model: String,
     cores: i32,
@@ -102,6 +110,7 @@ struct NodeInfo {
     gpus: Vec<GpuInfo>,
     disks: Vec<DiskInfo>,
     containers: Vec<ContainerInfo>,
+    stacks: Vec<StackInfo>,
     uptime: String,
     load_avg: String,
     agent_version: String,
@@ -121,6 +130,7 @@ impl Default for NodeInfo {
             gpus: vec![],
             disks: vec![],
             containers: vec![],
+            stacks: vec![],
             uptime: String::new(),
             load_avg: String::new(),
             agent_version: String::new(),
@@ -202,6 +212,17 @@ fn collect_via_grpc(m: &Machine) -> NodeInfo {
                     })
                     .collect();
 
+                let stacks = pb
+                    .stacks
+                    .iter()
+                    .map(|s| StackInfo {
+                        project_name: s.project_name.clone(),
+                        status: s.status.clone(),
+                        config_files: s.config_files.clone(),
+                        container_count: s.container_count,
+                    })
+                    .collect();
+
                 let mem = pb.memory.unwrap_or_default();
 
                 NodeInfo {
@@ -223,6 +244,7 @@ fn collect_via_grpc(m: &Machine) -> NodeInfo {
                     gpus,
                     disks,
                     containers,
+                    stacks,
                     uptime: pb.uptime,
                     load_avg: pb.load_avg,
                     agent_version: pb.agent_version,
@@ -243,7 +265,7 @@ fn collect_via_grpc(m: &Machine) -> NodeInfo {
 
 // ==================== TUI 应用 ====================
 
-const TAB_NAMES: &[&str] = &["总览", "CPU", "内存", "显卡", "磁盘", "容器"];
+const TAB_NAMES: &[&str] = &["总览", "CPU", "内存", "显卡", "磁盘", "容器", "堆栈"];
 
 struct App {
     nodes: Vec<NodeInfo>,
@@ -281,7 +303,32 @@ impl App {
                 }
                 n
             }
-            5 => self.nodes.iter().map(|n| n.containers.len()).sum(),
+            5 => {
+                let mut n = 0;
+                for node in &self.nodes {
+                    if node.containers.is_empty() {
+                        continue;
+                    }
+                    n += 1;
+                    if !self.collapsed_nodes.contains(&node.name) {
+                        n += node.containers.len();
+                    }
+                }
+                n
+            }
+            6 => {
+                let mut n = 0;
+                for node in &self.nodes {
+                    if node.stacks.is_empty() {
+                        continue;
+                    }
+                    n += 1;
+                    if !self.collapsed_nodes.contains(&node.name) {
+                        n += node.stacks.len();
+                    }
+                }
+                n
+            }
             _ => 0,
         }
     }
@@ -310,6 +357,7 @@ impl App {
             3 => self.node_name_at_gpu_row(self.selected_row),
             4 => self.node_name_at_disk_row(self.selected_row),
             5 => self.node_name_at_container_row(self.selected_row),
+            6 => self.node_name_at_stack_row(self.selected_row),
             _ => None,
         };
         if let Some(name) = name {
@@ -378,6 +426,26 @@ impl App {
         None
     }
 
+    fn node_name_at_stack_row(&self, row: usize) -> Option<String> {
+        let mut r = 0;
+        for node in &self.nodes {
+            if node.stacks.is_empty() {
+                continue;
+            }
+            if r == row {
+                return Some(node.name.clone());
+            }
+            r += 1;
+            if !self.collapsed_nodes.contains(&node.name) {
+                r += node.stacks.len();
+                if r > row {
+                    return Some(node.name.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// 获取选中行的容器信息 (节点 index, 容器引用)
     fn container_at_row(&self, row: usize) -> Option<(usize, &ContainerInfo)> {
         let mut r = 0;
@@ -385,12 +453,31 @@ impl App {
             if node.containers.is_empty() {
                 continue;
             }
-            // skip summary row
             r += 1;
             if !self.collapsed_nodes.contains(&node.name) {
                 for c in &node.containers {
                     if r == row {
                         return Some((ni, c));
+                    }
+                    r += 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// 获取选中行的堆栈信息 (堆栈 tab 专用)
+    fn stack_at_row(&self, row: usize) -> Option<(usize, &StackInfo)> {
+        let mut r = 0;
+        for (ni, node) in self.nodes.iter().enumerate() {
+            if node.stacks.is_empty() {
+                continue;
+            }
+            r += 1;
+            if !self.collapsed_nodes.contains(&node.name) {
+                for s in &node.stacks {
+                    if r == row {
+                        return Some((ni, s));
                     }
                     r += 1;
                 }
@@ -440,24 +527,25 @@ fn ui(f: &mut Frame, app: &mut App) {
         .divider(" │ ");
     f.render_widget(tabs, chunks[0]);
 
-    match app.current_tab {
-        0 => render_overview(f, chunks[1], app),
-        1 => render_cpu(f, chunks[1], app),
-        2 => render_memory(f, chunks[1], app),
-        3 => render_gpu(f, chunks[1], app),
-        4 => render_disk(f, chunks[1], app),
-        5 => render_containers(f, chunks[1], app),
-        _ => {}
-    }
+        match app.current_tab {
+            0 => render_overview(f, chunks[1], app),
+            1 => render_cpu(f, chunks[1], app),
+            2 => render_memory(f, chunks[1], app),
+            3 => render_gpu(f, chunks[1], app),
+            4 => render_disk(f, chunks[1], app),
+            5 => render_containers(f, chunks[1], app),
+            6 => render_stacks(f, chunks[1], app),
+            _ => {}
+        }
 
     let footer = Line::from(vec![
         Span::styled(" ←→切换Tab ", Style::default().fg(Color::Cyan)),
         Span::styled(" ↑↓滚动 ", Style::default().fg(Color::Cyan)),
         Span::styled(" Enter/Space折叠/展开 ", Style::default().fg(Color::Yellow)),
-        Span::styled(" s启动容器 ", Style::default().fg(Color::Green)),
-        Span::styled(" t停止容器 ", Style::default().fg(Color::Red)),
-        Span::styled(" q退出 ", Style::default().fg(Color::Cyan)),
+        Span::styled(" 容器Tab: s启动/t停止 ", Style::default().fg(Color::Green)),
+        Span::styled(" 堆栈Tab: c启动/d停止 ", Style::default().fg(Color::Yellow)),
         Span::styled(" r刷新 ", Style::default().fg(Color::Green)),
+        Span::styled(" q退出 ", Style::default().fg(Color::Cyan)),
     ]);
     f.render_widget(
         Paragraph::new(footer)
@@ -478,7 +566,8 @@ fn render_overview(f: &mut Frame, area: Rect, app: &App) {
     let offline = total - online;
     let gpu_total: usize = app.nodes.iter().map(|n| n.gpus.len()).sum();
     let container_total: usize = app.nodes.iter().map(|n| n.containers.len()).sum();
-    let summary = format!("总计 {} 节点 | 在线 {} | 离线 {} | GPU 总数 {} | 容器总数 {}", total, online, offline, gpu_total, container_total);
+    let stack_total: usize = app.nodes.iter().map(|n| n.stacks.len()).sum();
+    let summary = format!("总计 {} 节点 | 在线 {} | 离线 {} | GPU 总数 {} | 容器总数 {} | 堆栈总数 {}", total, online, offline, gpu_total, container_total, stack_total);
 
     f.render_widget(
         Paragraph::new(summary)
@@ -911,6 +1000,88 @@ fn render_containers(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn render_stacks(f: &mut Frame, area: Rect, app: &App) {
+    let headers = vec!["节点", "项目名称", "状态", "配置文件", "容器数"];
+    let widths = [
+        Constraint::Length(14),
+        Constraint::Length(22),
+        Constraint::Length(20),
+        Constraint::Length(60),
+        Constraint::Length(8),
+    ];
+
+    let header_cells = headers
+        .iter()
+        .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
+    let header_row = Row::new(header_cells).style(Style::default().bg(Color::DarkGray));
+
+    let mut rows = Vec::new();
+    let mut row_idx = 0usize;
+    for n in &app.nodes {
+        if n.stacks.is_empty() {
+            continue;
+        }
+        let collapsed = app.collapsed_nodes.contains(&n.name);
+        let count = n.stacks.len();
+        let summary = if collapsed {
+            format!(" ▶ {} ({}堆栈)", n.name, count)
+        } else {
+            format!(" ▼ {} ({}堆栈)", n.name, count)
+        };
+        let is_selected = row_idx == app.selected_row;
+        let summary_style = if is_selected {
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)
+        };
+        rows.push(
+            Row::new(vec![
+                Cell::from(Span::styled(summary, summary_style)),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+            ])
+            .style(if is_selected { Style::default().bg(Color::Blue) } else { Style::default() }),
+        );
+        row_idx += 1;
+
+        if !collapsed {
+            for s in &n.stacks {
+                let is_selected = row_idx == app.selected_row;
+                let row_style = if is_selected {
+                    Style::default().bg(Color::Blue).fg(Color::White)
+                } else {
+                    Style::default()
+                };
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(""),
+                        Cell::from(s.project_name.as_str()),
+                        Cell::from(s.status.as_str()),
+                        Cell::from(s.config_files.as_str()),
+                        Cell::from(s.container_count.to_string()),
+                    ])
+                    .style(row_style),
+                );
+                row_idx += 1;
+            }
+        }
+    }
+
+    let start = app.scroll_offset;
+    let visible_rows: Vec<Row> = rows.into_iter().skip(start).take(100).collect();
+    f.render_widget(
+        Table::new(visible_rows, &widths)
+            .header(header_row)
+            .block(Block::default().borders(Borders::ALL).title(" 堆栈信息（Enter/Space 折叠/展开节点，c 启动堆栈，d 停止堆栈） ")),
+        area,
+    );
+}
+
 // ==================== 主入口 ====================
 
 pub fn run_dashboard() {
@@ -1092,6 +1263,46 @@ fn start_tui(nodes: Vec<NodeInfo>, config: Config, refresh_interval: u64) {
                             let timeout = m.agent_timeout.unwrap_or(30);
                             let client = AgentClient::with_timeout(&m.ip, port, timeout);
                             let result = get_runtime().block_on(client.docker_stop(&c.container_id));
+                            match result {
+                                Ok(msg) => {
+                                    app.nodes = collect_all(&app.config.machines, true);
+                                    app.last_refresh = Local::now().format("%H:%M:%S").to_string();
+                                    let _ = fs::write("/tmp/node_agent_docker_msg.txt", format!("✅ {}\n", msg));
+                                }
+                                Err(e) => {
+                                    let _ = fs::write("/tmp/node_agent_docker_msg.txt", format!("❌ {}\n", e));
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('c') if app.current_tab == 6 => {
+                        // 启动 Compose 堆栈
+                        if let Some((ni, s)) = app.stack_at_row(app.selected_row) {
+                            let m = &app.config.machines[ni];
+                            let port = m.agent_port.unwrap_or(50051);
+                            let timeout = m.agent_timeout.unwrap_or(30);
+                            let client = AgentClient::with_timeout(&m.ip, port, timeout);
+                            let result = get_runtime().block_on(client.compose_up(&s.project_name));
+                            match result {
+                                Ok(msg) => {
+                                    app.nodes = collect_all(&app.config.machines, true);
+                                    app.last_refresh = Local::now().format("%H:%M:%S").to_string();
+                                    let _ = fs::write("/tmp/node_agent_docker_msg.txt", format!("✅ {}\n", msg));
+                                }
+                                Err(e) => {
+                                    let _ = fs::write("/tmp/node_agent_docker_msg.txt", format!("❌ {}\n", e));
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('d') if app.current_tab == 6 => {
+                        // 停止 Compose 堆栈
+                        if let Some((ni, s)) = app.stack_at_row(app.selected_row) {
+                            let m = &app.config.machines[ni];
+                            let port = m.agent_port.unwrap_or(50051);
+                            let timeout = m.agent_timeout.unwrap_or(30);
+                            let client = AgentClient::with_timeout(&m.ip, port, timeout);
+                            let result = get_runtime().block_on(client.compose_down(&s.project_name));
                             match result {
                                 Ok(msg) => {
                                     app.nodes = collect_all(&app.config.machines, true);

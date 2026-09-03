@@ -133,6 +133,30 @@ impl AgentClient {
         Ok(resp.into_inner().message)
     }
 
+    /// 启动 Docker Compose 堆栈
+    pub async fn compose_up(&self, project_name: &str) -> Result<String, String> {
+        let mut client = self.client().map_err(|e| format!("连接失败: {}", e))?;
+        let resp = client
+            .compose_up(DockerComposeRequest {
+                project_name: project_name.to_string(),
+            })
+            .await
+            .map_err(|e| format!("Compose 启动失败: {}", e))?;
+        Ok(resp.into_inner().message)
+    }
+
+    /// 停止 Docker Compose 堆栈
+    pub async fn compose_down(&self, project_name: &str) -> Result<String, String> {
+        let mut client = self.client().map_err(|e| format!("连接失败: {}", e))?;
+        let resp = client
+            .compose_down(DockerComposeRequest {
+                project_name: project_name.to_string(),
+            })
+            .await
+            .map_err(|e| format!("Compose 停止失败: {}", e))?;
+        Ok(resp.into_inner().message)
+    }
+
     /// 连接并采集完整信息（一个连接完成 ping + get_node_info）
     pub async fn connect_and_collect(&self) -> Result<AgentConnection, String> {
         self.ping().await
@@ -304,6 +328,64 @@ pub async fn batch_docker_stop_with_timeout(
             let client = AgentClient::with_timeout(ip, *port, timeout_secs);
             let container_id = container_id.clone();
             async move { (ip.clone(), client.docker_stop(&container_id).await) }
+        })
+        .collect();
+
+    join_all(tasks).await
+}
+
+/// 并发批量启动 Compose 堆栈
+pub async fn batch_compose_up(
+    targets: &[(String, u16)],
+    project_name: &str,
+) -> Vec<(String, Result<String, String>)> {
+    batch_compose_up_with_timeout(targets, project_name, 30).await
+}
+
+/// 并发批量启动 Compose 堆栈（自定义超时）
+pub async fn batch_compose_up_with_timeout(
+    targets: &[(String, u16)],
+    project_name: &str,
+    timeout_secs: u64,
+) -> Vec<(String, Result<String, String>)> {
+    use futures::future::join_all;
+
+    let project_name = project_name.to_string();
+    let tasks: Vec<_> = targets
+        .iter()
+        .map(|(ip, port)| {
+            let client = AgentClient::with_timeout(ip, *port, timeout_secs);
+            let project_name = project_name.clone();
+            async move { (ip.clone(), client.compose_up(&project_name).await) }
+        })
+        .collect();
+
+    join_all(tasks).await
+}
+
+/// 并发批量停止 Compose 堆栈
+pub async fn batch_compose_down(
+    targets: &[(String, u16)],
+    project_name: &str,
+) -> Vec<(String, Result<String, String>)> {
+    batch_compose_down_with_timeout(targets, project_name, 30).await
+}
+
+/// 并发批量停止 Compose 堆栈（自定义超时）
+pub async fn batch_compose_down_with_timeout(
+    targets: &[(String, u16)],
+    project_name: &str,
+    timeout_secs: u64,
+) -> Vec<(String, Result<String, String>)> {
+    use futures::future::join_all;
+
+    let project_name = project_name.to_string();
+    let tasks: Vec<_> = targets
+        .iter()
+        .map(|(ip, port)| {
+            let client = AgentClient::with_timeout(ip, *port, timeout_secs);
+            let project_name = project_name.clone();
+            async move { (ip.clone(), client.compose_down(&project_name).await) }
         })
         .collect();
 

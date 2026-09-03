@@ -27,6 +27,12 @@ service NodeAgent {
 
   // 停止 Docker 容器
   rpc DockerStop(DockerContainerRequest) returns (DockerContainerResponse);
+
+  // 启动 Docker Compose 堆栈
+  rpc ComposeUp(DockerComposeRequest) returns (DockerComposeResponse);
+
+  // 停止 Docker Compose 堆栈
+  rpc ComposeDown(DockerComposeRequest) returns (DockerComposeResponse);
 }
 
 // ──────────────────────────────────────
@@ -64,6 +70,7 @@ message NodeInfo {
   string agent_version = 11;
   int64 uptime_seconds = 12;
   repeated ContainerInfo containers = 13;
+  repeated StackInfo stacks = 14;
 }
 
 message ContainerInfo {
@@ -72,6 +79,13 @@ message ContainerInfo {
   string image = 3;
   string status = 4;
   string ports = 5;
+}
+
+message StackInfo {
+  string project_name = 1;
+  string status = 2;
+  string config_files = 3;
+  int32 container_count = 4;
 }
 
 message MemoryInfo {
@@ -136,6 +150,15 @@ message DockerContainerRequest {
 }
 
 message DockerContainerResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message DockerComposeRequest {
+  string project_name = 1;
+}
+
+message DockerComposeResponse {
   bool success = 1;
   string message = 2;
 }

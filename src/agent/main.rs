@@ -82,6 +82,24 @@ enum Commands {
         #[arg(long)]
         container_id: String,
     },
+    /// 启动 Docker Compose 堆栈
+    ComposeUp {
+        /// 目标节点, 格式 ip:port
+        #[arg(required = true, num_args = 1..)]
+        targets: Vec<String>,
+        /// 项目名称
+        #[arg(long)]
+        project_name: String,
+    },
+    /// 停止 Docker Compose 堆栈
+    ComposeDown {
+        /// 目标节点, 格式 ip:port
+        #[arg(required = true, num_args = 1..)]
+        targets: Vec<String>,
+        /// 项目名称
+        #[arg(long)]
+        project_name: String,
+    },
 }
 
 fn parse_targets(raw: &[String]) -> Vec<(String, u16)> {
@@ -227,6 +245,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let results = client::batch_docker_stop_with_timeout(&targets, &container_id, global_timeout).await;
+            for (ip, result) in results {
+                match result {
+                    Ok(msg) => println!("✅  {:20}  {}", ip, msg),
+                    Err(e) => println!("❌  {:20}  {}", ip, e),
+                }
+            }
+        }
+
+        Commands::ComposeUp {
+            targets,
+            project_name,
+        } => {
+            let targets = parse_targets(&targets);
+            println!(
+                "向 {} 个节点下发 Compose 启动指令 (项目: {})...\n",
+                targets.len(),
+                project_name
+            );
+
+            let results = client::batch_compose_up_with_timeout(&targets, &project_name, global_timeout).await;
+            for (ip, result) in results {
+                match result {
+                    Ok(msg) => println!("✅  {:20}  {}", ip, msg),
+                    Err(e) => println!("❌  {:20}  {}", ip, e),
+                }
+            }
+        }
+
+        Commands::ComposeDown {
+            targets,
+            project_name,
+        } => {
+            let targets = parse_targets(&targets);
+            println!(
+                "向 {} 个节点下发 Compose 停止指令 (项目: {})...\n",
+                targets.len(),
+                project_name
+            );
+
+            let results = client::batch_compose_down_with_timeout(&targets, &project_name, global_timeout).await;
             for (ip, result) in results {
                 match result {
                     Ok(msg) => println!("✅  {:20}  {}", ip, msg),

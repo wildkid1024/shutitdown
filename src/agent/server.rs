@@ -203,6 +203,75 @@ impl NodeAgentService {
         }
     }
 
+    /// 采集 Docker Compose 堆栈
+    fn collect_stacks() -> Vec<StackInfo> {
+        let _t = Instant::now();
+
+        let check = Self::run_command_debug("compose check",
+            "docker compose version 2>/dev/null || echo 'N/A'"
+        );
+        let available = match check {
+            Ok((code, ref out, _)) => code == 0 && out != "N/A" && !out.is_empty(),
+            _ => false,
+        };
+        if !available {
+            Self::debug_log("collect_stacks: docker compose 不可用".into());
+            return vec![];
+        }
+
+        let result = Self::run_command_debug("docker compose ls",
+            "docker compose ls --format json 2>/dev/null || echo '[]'"
+        );
+
+        match result {
+            Ok((_code, ref stdout, _)) => {
+                let body = stdout.trim();
+                if body.is_empty() || body == "[]" || body == "null" {
+                    return vec![];
+                }
+
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "PascalCase")]
+                struct ComposeLsEntry { name: String, status: String, config_files: String }
+
+                let entries: Vec<ComposeLsEntry> = match serde_json::from_str(body) {
+                    Ok(e) => e,
+                    Err(_) => {
+                        // 可能是 NDJSON（每行一个 JSON 对象）
+                        let mut result = Vec::new();
+                        for line in body.lines() {
+                            if let Ok(entry) = serde_json::from_str::<ComposeLsEntry>(line.trim()) {
+                                result.push(entry);
+                            }
+                        }
+                        result
+                    }
+                };
+
+                let stacks: Vec<StackInfo> = entries.into_iter().map(|e| {
+                    // 解析状态中的容器总数，处理 "running(2)" 或 "restarting(1), running(9)" 等格式
+                    let container_count = e.status
+                        .split(|c: char| c == '(' || c == ')' || c == ',')
+                        .filter_map(|s| s.trim().parse::<i32>().ok())
+                        .sum();
+                    StackInfo {
+                        project_name: e.name,
+                        status: e.status,
+                        config_files: e.config_files,
+                        container_count,
+                    }
+                }).collect();
+
+                Self::debug_log(format!("collect_stacks: {}ms, count={}", _t.elapsed().as_millis(), stacks.len()));
+                stacks
+            }
+            Err(e) => {
+                Self::debug_log(format!("collect_stacks 失败: {}", e));
+                vec![]
+            }
+        }
+    }
+
     /// 格式化 Docker 端口映射
     fn format_docker_ports(ports: Option<&Vec<serde_json::Value>>) -> String {
         let ports = match ports {
@@ -264,6 +333,10 @@ impl NodeAgentService {
         Self::debug_log(format!("collect_containers: {}ms, count={}", _t.elapsed().as_millis(), containers.len()));
 
         let _t = Instant::now();
+        let stacks = Self::collect_stacks();
+        Self::debug_log(format!("collect_stacks: {}ms, count={}", _t.elapsed().as_millis(), stacks.len()));
+
+        let _t = Instant::now();
         let disks = Self::collect_disks_debug();
         Self::debug_log(format!("collect_disks: {}ms, count={}", _t.elapsed().as_millis(), disks.len()));
 
@@ -299,6 +372,7 @@ impl NodeAgentService {
             gpus,
             containers,
             disks,
+            stacks,
             uptime,
             load_avg: load,
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -639,6 +713,59 @@ impl NodeAgent for NodeAgentService {
                 }
             }
             Err(e) => Ok(Response::new(DockerContainerResponse {
+                success: false,
+                message: e,
+            })),
+        }
+    }
+
+    async fn compose_up(
+        &self,
+        request: Request<DockerComposeRequest>,
+    ) -> Result<Response<DockerComposeResponse>, Status> {
+        let project_name = request.into_inner().project_name;
+        // shell 转义
+        let escaped = project_name.replace('\'', "'\\''");
+        let cmd = format!("docker compose -p '{}' up -d 2>&1", escaped);
+        match Self::run_command(&cmd) {
+            Ok((code, ref out, ref err)) => {
+                let msg = if !out.is_empty() { out.clone() } else { err.clone() };
+                Ok(Response::new(DockerComposeResponse {
+                    success: code == 0,
+                    message: if code == 0 {
+                        format!("堆栈 {} 已启动", project_name)
+                    } else {
+                        format!("启动失败: {}", msg)
+                    },
+                }))
+            }
+            Err(e) => Ok(Response::new(DockerComposeResponse {
+                success: false,
+                message: e,
+            })),
+        }
+    }
+
+    async fn compose_down(
+        &self,
+        request: Request<DockerComposeRequest>,
+    ) -> Result<Response<DockerComposeResponse>, Status> {
+        let project_name = request.into_inner().project_name;
+        let escaped = project_name.replace('\'', "'\\''");
+        let cmd = format!("docker compose -p '{}' down 2>&1", escaped);
+        match Self::run_command(&cmd) {
+            Ok((code, ref out, ref err)) => {
+                let msg = if !out.is_empty() { out.clone() } else { err.clone() };
+                Ok(Response::new(DockerComposeResponse {
+                    success: code == 0,
+                    message: if code == 0 {
+                        format!("堆栈 {} 已停止", project_name)
+                    } else {
+                        format!("停止失败: {}", msg)
+                    },
+                }))
+            }
+            Err(e) => Ok(Response::new(DockerComposeResponse {
                 success: false,
                 message: e,
             })),
