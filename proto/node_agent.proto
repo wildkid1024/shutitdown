@@ -86,6 +86,16 @@ message StackInfo {
   string status = 2;
   string config_files = 3;
   int32 container_count = 4;
+  repeated StackContainerInfo containers = 5;
+}
+
+message StackContainerInfo {
+  string container_id = 1;
+  string name = 2;
+  string image = 3;
+  string status = 4;
+  string ports = 5;
+  string service_name = 6;
 }
 
 message MemoryInfo {

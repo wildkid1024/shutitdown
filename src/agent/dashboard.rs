@@ -77,11 +77,22 @@ struct ContainerInfo {
 }
 
 #[derive(Debug, Clone, Default)]
+struct StackContainerInfo {
+    container_id: String,
+    name: String,
+    image: String,
+    status: String,
+    ports: String,
+    service_name: String,
+}
+
+#[derive(Debug, Clone, Default)]
 struct StackInfo {
     project_name: String,
     status: String,
     config_files: String,
     container_count: i32,
+    containers: Vec<StackContainerInfo>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -215,11 +226,22 @@ fn collect_via_grpc(m: &Machine) -> NodeInfo {
                 let stacks = pb
                     .stacks
                     .iter()
-                    .map(|s| StackInfo {
-                        project_name: s.project_name.clone(),
-                        status: s.status.clone(),
-                        config_files: s.config_files.clone(),
-                        container_count: s.container_count,
+                    .map(|s| {
+                        let containers = s.containers.iter().map(|c| StackContainerInfo {
+                            container_id: c.container_id.clone(),
+                            name: c.name.clone(),
+                            image: c.image.clone(),
+                            status: c.status.clone(),
+                            ports: c.ports.clone(),
+                            service_name: c.service_name.clone(),
+                        }).collect();
+                        StackInfo {
+                            project_name: s.project_name.clone(),
+                            status: s.status.clone(),
+                            config_files: s.config_files.clone(),
+                            container_count: s.container_count,
+                            containers,
+                        }
                     })
                     .collect();
 
@@ -274,6 +296,8 @@ struct App {
     scroll_offset: usize,
     selected_row: usize,
     collapsed_nodes: HashSet<String>,
+    /// 折叠的堆栈 key: 格式 "node名\0项目名"
+    collapsed_stacks: HashSet<String>,
     last_refresh: String,
 }
 
@@ -322,9 +346,15 @@ impl App {
                     if node.stacks.is_empty() {
                         continue;
                     }
-                    n += 1;
-                    if !self.collapsed_nodes.contains(&node.name) {
-                        n += node.stacks.len();
+                    n += 1; // 节点行
+                    if self.collapsed_nodes.contains(&node.name) {
+                        continue;
+                    }
+                    for s in &node.stacks {
+                        n += 1; // 堆栈行
+                        if !self.stack_is_collapsed(&node.name, &s.project_name) {
+                            n += s.containers.len();
+                        }
                     }
                 }
                 n
@@ -353,6 +383,19 @@ impl App {
     }
 
     fn toggle_selected_node(&mut self) {
+        // 堆栈 tab 特殊处理：优先折叠/展开堆栈，其次折叠/展开节点
+        if self.current_tab == 6 {
+            if let Some((ni, s)) = self.stack_at_row(self.selected_row) {
+                let node = &self.nodes[ni];
+                let key = Self::stack_key(&node.name, &s.project_name);
+                if self.collapsed_stacks.contains(&key) {
+                    self.collapsed_stacks.remove(&key);
+                } else {
+                    self.collapsed_stacks.insert(key);
+                }
+                return;
+            }
+        }
         let name = match self.current_tab {
             3 => self.node_name_at_gpu_row(self.selected_row),
             4 => self.node_name_at_disk_row(self.selected_row),
@@ -367,6 +410,14 @@ impl App {
                 self.collapsed_nodes.insert(name);
             }
         }
+    }
+
+    fn stack_key(node: &str, project: &str) -> String {
+        format!("{}\u{0}{}", node, project)
+    }
+
+    fn stack_is_collapsed(&self, node: &str, project: &str) -> bool {
+        self.collapsed_stacks.contains(&Self::stack_key(node, project))
     }
 
     fn node_name_at_gpu_row(&self, row: usize) -> Option<String> {
@@ -437,9 +488,14 @@ impl App {
             }
             r += 1;
             if !self.collapsed_nodes.contains(&node.name) {
-                r += node.stacks.len();
-                if r > row {
-                    return Some(node.name.clone());
+                for s in &node.stacks {
+                    r += 1;
+                    if !self.stack_is_collapsed(&node.name, &s.project_name) {
+                        r += s.containers.len();
+                    }
+                    if r > row {
+                        return Some(node.name.clone());
+                    }
                 }
             }
         }
@@ -466,7 +522,7 @@ impl App {
         None
     }
 
-    /// 获取选中行的堆栈信息 (堆栈 tab 专用)
+    /// 获取选中行的堆栈信息 (堆栈 tab 专用，计入容器行偏移)
     fn stack_at_row(&self, row: usize) -> Option<(usize, &StackInfo)> {
         let mut r = 0;
         for (ni, node) in self.nodes.iter().enumerate() {
@@ -480,6 +536,9 @@ impl App {
                         return Some((ni, s));
                     }
                     r += 1;
+                    if !self.stack_is_collapsed(&node.name, &s.project_name) {
+                        r += s.containers.len();
+                    }
                 }
             }
         }
@@ -541,7 +600,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     let footer = Line::from(vec![
         Span::styled(" ←→切换Tab ", Style::default().fg(Color::Cyan)),
         Span::styled(" ↑↓滚动 ", Style::default().fg(Color::Cyan)),
-        Span::styled(" Enter/Space折叠/展开 ", Style::default().fg(Color::Yellow)),
+        Span::styled(" Enter/Space折叠(节点/堆栈) ", Style::default().fg(Color::Yellow)),
         Span::styled(" 容器Tab: s启动/t停止 ", Style::default().fg(Color::Green)),
         Span::styled(" 堆栈Tab: c启动/d停止 ", Style::default().fg(Color::Yellow)),
         Span::styled(" r刷新 ", Style::default().fg(Color::Green)),
@@ -1001,13 +1060,14 @@ fn render_containers(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_stacks(f: &mut Frame, area: Rect, app: &App) {
-    let headers = vec!["节点", "项目名称", "状态", "配置文件", "容器数"];
+    let headers = vec!["节点/项目", "容器ID", "服务名", "镜像", "状态", "端口"];
     let widths = [
+        Constraint::Length(28),
         Constraint::Length(14),
-        Constraint::Length(22),
         Constraint::Length(20),
-        Constraint::Length(60),
-        Constraint::Length(8),
+        Constraint::Length(28),
+        Constraint::Length(14),
+        Constraint::Length(30),
     ];
 
     let header_cells = headers
@@ -1044,6 +1104,7 @@ fn render_stacks(f: &mut Frame, area: Rect, app: &App) {
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(""),
+                Cell::from(""),
             ])
             .style(if is_selected { Style::default().bg(Color::Blue) } else { Style::default() }),
         );
@@ -1051,23 +1112,52 @@ fn render_stacks(f: &mut Frame, area: Rect, app: &App) {
 
         if !collapsed {
             for s in &n.stacks {
+                // 堆栈摘要行（项目名跨第1列，状态在第5列）
+                let stack_collapsed = app.stack_is_collapsed(&n.name, &s.project_name);
                 let is_selected = row_idx == app.selected_row;
                 let row_style = if is_selected {
                     Style::default().bg(Color::Blue).fg(Color::White)
                 } else {
-                    Style::default()
+                    Style::default().fg(Color::Yellow)
                 };
+                let arrow = if stack_collapsed { "▶" } else { "▼" };
+                let stack_label = format!("  {} {} [{}容器]", arrow, s.project_name, s.container_count);
                 rows.push(
                     Row::new(vec![
+                        Cell::from(Span::styled(stack_label, Style::default().fg(Color::Yellow))),
                         Cell::from(""),
-                        Cell::from(s.project_name.as_str()),
+                        Cell::from(""),
+                        Cell::from(""),
                         Cell::from(s.status.as_str()),
-                        Cell::from(s.config_files.as_str()),
-                        Cell::from(s.container_count.to_string()),
+                        Cell::from(""),
                     ])
                     .style(row_style),
                 );
                 row_idx += 1;
+
+                // 每个堆栈下的容器详情行（仅当堆栈展开时）
+                if !stack_collapsed {
+                    for c in &s.containers {
+                        let is_selected = row_idx == app.selected_row;
+                        let row_style = if is_selected {
+                            Style::default().bg(Color::Blue).fg(Color::White)
+                        } else {
+                            Style::default()
+                        };
+                        rows.push(
+                            Row::new(vec![
+                                Cell::from(""),
+                                Cell::from(c.container_id.as_str()),
+                                Cell::from(c.service_name.as_str()),
+                                Cell::from(c.image.as_str()),
+                                Cell::from(c.status.as_str()),
+                                Cell::from(c.ports.as_str()),
+                            ])
+                            .style(row_style),
+                        );
+                        row_idx += 1;
+                    }
+                }
             }
         }
     }
@@ -1186,6 +1276,7 @@ fn start_tui(nodes: Vec<NodeInfo>, config: Config, refresh_interval: u64) {
         scroll_offset: 0,
         selected_row: 0,
         collapsed_nodes: HashSet::new(),
+        collapsed_stacks: HashSet::new(),
         last_refresh: Local::now().format("%H:%M:%S").to_string(),
     };
 

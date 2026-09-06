@@ -327,22 +327,26 @@ elif command -v rocm-smi &>/dev/null; then \
 else \
   lspci 2>/dev/null | grep -iE '3D|VGA|Display' | head -5 | sed 's/.*: //' || echo 'N/A'; \
 fi; \
-echo '===GPU_DOCKER==='; \
-if command -v nvidia-smi &>/dev/null; then \
-  nvidia-smi --query-compute-apps=index,pid --format=csv,noheader,nounits 2>/dev/null | while IFS=', ' read -r gpu_idx pid; do \
+	echo '===GPU_DOCKER==='; \
+	if command -v nvidia-smi &>/dev/null; then \
+  nvidia-smi --query-gpu=index,gpu_bus_id --format=csv,noheader 2>/dev/null | while IFS=', ' read -r idx bus_id; do \
+    eval "bus_map_$bus_id=$idx"; \
+  done; \
+  nvidia-smi --query-compute-apps=gpu_bus_id,pid --format=csv,noheader 2>/dev/null | while IFS=', ' read -r bus_id pid; do \
     if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then \
+      gpu_idx=$(eval echo \$bus_map_$bus_id); \
       cname=$(docker ps --no-trunc --format '{{.ID}} {{.Names}}' 2>/dev/null | while read -r cid cname; do \
         if docker inspect "$cid" 2>/dev/null | grep -q '"pid": '$pid',\|"pid":'$pid' '; then echo "$cname"; break; fi; \
       done); \
-      if [ -n "$cname" ]; then echo "$gpu_idx,$cname"; fi; \
+      if [ -n "$gpu_idx" ] && [ -n "$cname" ]; then echo "$gpu_idx,$cname"; fi; \
     fi; \
   done; \
-elif command -v npu-smi &>/dev/null; then \
+	elif command -v npu-smi &>/dev/null; then \
   docker ps --no-trunc --format '{{.ID}} {{.Names}} {{.Command}}' 2>/dev/null | grep -i npu-smi | while read -r cid cname cmd; do \
     npu_idx=$(echo "$cmd" | grep -oP 'np[_-]?device[=: ][0-9]+|device=[0-9]+' | grep -oP '[0-9]+$' | head -1); \
     if [ -n "$npu_idx" ]; then echo "$npu_idx,$cname"; fi; \
   done; \
-fi; \
+	fi; \
 echo '===DISKS==='; \
   df -h 2>/dev/null | awk 'NR>1 {printf "%s,%s,%s,%s,%s\n", $6,$2,$3,$4,$5}' || echo 'N/A'; \
 echo '===UPTIME==='; (uptime -p 2>/dev/null || uptime 2>/dev/null || echo 'N/A')"###

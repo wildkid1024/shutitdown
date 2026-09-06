@@ -254,11 +254,67 @@ impl NodeAgentService {
                         .split(|c: char| c == '(' || c == ')' || c == ',')
                         .filter_map(|s| s.trim().parse::<i32>().ok())
                         .sum();
+
+                    // 查询每个堆栈的容器详情 ({{json .}} 输出每行一个 JSON 对象)
+                    let escaped = e.name.replace('\'', "'\\''");
+                    let ps_cmd = format!("docker compose -p '{}' ps --format '{{{{json .}}}}' 2>/dev/null", escaped);
+                    let containers = match Self::run_command_debug(&format!("compose ps {}", e.name), &ps_cmd) {
+                        Ok((_, ref out, _)) => {
+                            let body = out.trim();
+                            if body.is_empty() || body == "[]" || body == "null" {
+                                vec![]
+                            } else {
+                                // 兼容 JSON 数组 与 NDJSON（每行一个对象）
+                                let json_values: Vec<serde_json::Value> = if body.starts_with('[') {
+                                    serde_json::from_str::<Vec<serde_json::Value>>(body).unwrap_or_default()
+                                } else {
+                                    body.lines()
+                                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+                                        .collect()
+                                };
+                                json_values.into_iter().filter_map(|v| {
+                                    let s = |k1: &str, k2: &str| v.get(k1).or_else(|| v.get(k2))
+                                        .and_then(|x| x.as_str()).map(|x| x.to_string()).unwrap_or_default();
+                                    let id_raw = s("ID", "Id");
+                                    let cid: String = id_raw.chars().take(12).collect();
+                                    let name = s("Name", "name");
+                                    let image = s("Image", "image");
+                                    let state = s("State", "state");
+                                    let status = s("Status", "status");
+                                    let state = if state.is_empty() { status.clone() } else { state };
+                                    // 服务名优先用 Service 字段，没有则从容器名推导
+                                    let svc_raw = s("Service", "service");
+                                    let svc = if !svc_raw.is_empty() {
+                                        svc_raw
+                                    } else {
+                                        name.rsplit_once(|c: char| c == '_' || c == '-')
+                                            .map(|(_, last)| last.to_string())
+                                            .unwrap_or_else(|| name.clone())
+                                    };
+                                    if name.is_empty() && image.is_empty() {
+                                        None
+                                    } else {
+                                        Some(StackContainerInfo {
+                                            container_id: if cid.is_empty() { String::from("N/A") } else { cid },
+                                            name,
+                                            image,
+                                            status: state,
+                                            ports: s("Ports", "ports"),
+                                            service_name: svc,
+                                        })
+                                    }
+                                }).collect()
+                            }
+                        }
+                        Err(_) => vec![],
+                    };
+
                     StackInfo {
                         project_name: e.name,
                         status: e.status,
                         config_files: e.config_files,
                         container_count,
+                        containers,
                     }
                 }).collect();
 
