@@ -157,6 +157,24 @@ impl AgentClient {
         Ok(resp.into_inner().message)
     }
 
+    /// 获取 Docker 容器日志
+    pub async fn docker_logs(
+        &self,
+        container_id: &str,
+        tail: i32,
+    ) -> Result<(bool, String, String), String> {
+        let mut client = self.client().map_err(|e| format!("连接失败: {}", e))?;
+        let resp = client
+            .docker_logs(DockerLogsRequest {
+                container_id: container_id.to_string(),
+                tail,
+            })
+            .await
+            .map_err(|e| format!("获取日志失败: {}", e))?;
+        let inner = resp.into_inner();
+        Ok((inner.success, inner.logs, inner.message))
+    }
+
     /// 连接并采集完整信息（一个连接完成 ping + get_node_info）
     pub async fn connect_and_collect(&self) -> Result<AgentConnection, String> {
         self.ping().await

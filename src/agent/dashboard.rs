@@ -289,6 +289,13 @@ fn collect_via_grpc(m: &Machine) -> NodeInfo {
 
 const TAB_NAMES: &[&str] = &["总览", "CPU", "内存", "显卡", "磁盘", "容器", "堆栈"];
 
+/// 日志弹窗状态
+struct LogPopup {
+    title: String,
+    lines: Vec<String>,
+    scroll_offset: usize,
+}
+
 struct App {
     nodes: Vec<NodeInfo>,
     config: Config,
@@ -298,6 +305,8 @@ struct App {
     collapsed_nodes: HashSet<String>,
     /// 折叠的堆栈 key: 格式 "node名\0项目名"
     collapsed_stacks: HashSet<String>,
+    /// 日志弹窗 (None 表示未打开)
+    log_popup: Option<LogPopup>,
     last_refresh: String,
 }
 
@@ -544,6 +553,51 @@ impl App {
         }
         None
     }
+
+    /// 获取堆栈 tab 中选中行的容器 (节点 index, 容器引用)
+    fn stack_container_at_row(&self, row: usize) -> Option<(usize, &StackContainerInfo)> {
+        let mut r = 0;
+        for (ni, node) in self.nodes.iter().enumerate() {
+            if node.stacks.is_empty() {
+                continue;
+            }
+            r += 1;
+            if self.collapsed_nodes.contains(&node.name) {
+                continue;
+            }
+            for s in &node.stacks {
+                r += 1;
+                if !self.stack_is_collapsed(&node.name, &s.project_name) {
+                    for c in &s.containers {
+                        if r == row {
+                            return Some((ni, c));
+                        }
+                        r += 1;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 根据节点名和容器ID，在堆栈中查找匹配的容器（返回节点 index 与容器 ID）
+    fn find_stack_container(
+        &self,
+        node_name: &str,
+        container_id: &str,
+    ) -> Option<(usize, String)> {
+        self.nodes.iter().enumerate().find_map(|(ni, node)| {
+            if node.name != node_name {
+                return None;
+            }
+            node.stacks.iter().any(|s| {
+                s.containers
+                    .iter()
+                    .any(|c| c.container_id == container_id)
+            })
+            .then(|| (ni, container_id.to_string()))
+        })
+    }
 }
 
 fn text_bar(pct: f64, width: u16) -> String {
@@ -601,8 +655,8 @@ fn ui(f: &mut Frame, app: &mut App) {
         Span::styled(" ←→切换Tab ", Style::default().fg(Color::Cyan)),
         Span::styled(" ↑↓滚动 ", Style::default().fg(Color::Cyan)),
         Span::styled(" Enter/Space折叠(节点/堆栈) ", Style::default().fg(Color::Yellow)),
-        Span::styled(" 容器Tab: s启动/t停止 ", Style::default().fg(Color::Green)),
-        Span::styled(" 堆栈Tab: c启动/d停止 ", Style::default().fg(Color::Yellow)),
+        Span::styled(" 容器/堆栈Tab: s启动/t停止容器 l日志 ", Style::default().fg(Color::Green)),
+        Span::styled(" 堆栈行: c启动/d停止堆栈 ", Style::default().fg(Color::Magenta)),
         Span::styled(" r刷新 ", Style::default().fg(Color::Green)),
         Span::styled(" q退出 ", Style::default().fg(Color::Cyan)),
     ]);
@@ -611,6 +665,53 @@ fn ui(f: &mut Frame, app: &mut App) {
             .style(Style::default().fg(Color::DarkGray))
             .block(Block::default().borders(Borders::ALL)),
         chunks[2],
+    );
+
+    // 日志弹窗覆盖在最上层
+    if let Some(popup) = &app.log_popup {
+        render_log_popup(f, popup);
+    }
+}
+
+/// 渲染日志弹窗
+fn render_log_popup(f: &mut Frame, popup: &LogPopup) {
+    let area = f.area();
+    let w = (area.width * 3 / 4).min(120).max(50);
+    let h = (area.height * 3 / 4).min(40).max(15);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup_area = Rect::new(x, y, w, h);
+
+    // 半透明遮罩
+    let mask = ratatui::widgets::Clear;
+    f.render_widget(mask, popup_area);
+    f.render_widget(
+        ratatui::widgets::Block::default()
+            .title(popup.title.clone())
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+        popup_area,
+    );
+
+    let inner = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + 1,
+        width: popup_area.width.saturating_sub(2),
+        height: popup_area.height.saturating_sub(2),
+    };
+
+    let lines: Vec<Line> = popup
+        .lines
+        .iter()
+        .skip(popup.scroll_offset)
+        .take(inner.height as usize)
+        .map(|l| Line::from(l.as_str()))
+        .collect();
+
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(lines)
+            .style(Style::default().fg(Color::White)),
+        inner,
     );
 }
 
@@ -1277,6 +1378,7 @@ fn start_tui(nodes: Vec<NodeInfo>, config: Config, refresh_interval: u64) {
         selected_row: 0,
         collapsed_nodes: HashSet::new(),
         collapsed_stacks: HashSet::new(),
+        log_popup: None,
         last_refresh: Local::now().format("%H:%M:%S").to_string(),
     };
 
@@ -1302,6 +1404,38 @@ fn start_tui(nodes: Vec<NodeInfo>, config: Config, refresh_interval: u64) {
 
         if let Ok(true) = event::poll(Duration::from_millis(500)) {
             if let Ok(Event::Key(key)) = event::read() {
+                // 日志弹窗打开时的按键处理优先
+                if app.log_popup.is_some() {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            app.log_popup = None;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if let Some(p) = app.log_popup.as_mut() {
+                                let max = p.lines.len().saturating_sub(1);
+                                p.scroll_offset = (p.scroll_offset + 1).min(max);
+                            }
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if let Some(p) = app.log_popup.as_mut() {
+                                p.scroll_offset = p.scroll_offset.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::PageDown | KeyCode::Char('f') => {
+                            if let Some(p) = app.log_popup.as_mut() {
+                                p.scroll_offset = (p.scroll_offset + 20).min(p.lines.len().saturating_sub(1));
+                            }
+                        }
+                        KeyCode::PageUp | KeyCode::Char('b') => {
+                            if let Some(p) = app.log_popup.as_mut() {
+                                p.scroll_offset = p.scroll_offset.saturating_sub(20);
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Char('r') => {
@@ -1326,14 +1460,21 @@ fn start_tui(nodes: Vec<NodeInfo>, config: Config, refresh_interval: u64) {
                     KeyCode::Down | KeyCode::Char('j') => app.select_next(),
                     KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
                     KeyCode::Enter | KeyCode::Char(' ') => app.toggle_selected_node(),
-                    KeyCode::Char('s') if app.current_tab == 5 => {
-                        // 启动容器
-                        if let Some((ni, c)) = app.container_at_row(app.selected_row) {
+                    KeyCode::Char('s') if app.current_tab == 5 || app.current_tab == 6 => {
+                        // 启动容器 (tab5 普通容器, tab6 堆栈内容器)
+                        let target = if app.current_tab == 5 {
+                            app.container_at_row(app.selected_row)
+                                .map(|(ni, c)| (ni, c.container_id.clone()))
+                        } else {
+                            app.stack_container_at_row(app.selected_row)
+                                .map(|(ni, c)| (ni, c.container_id.clone()))
+                        };
+                        if let Some((ni, cid)) = target {
                             let m = &app.config.machines[ni];
                             let port = m.agent_port.unwrap_or(50051);
                             let timeout = m.agent_timeout.unwrap_or(30);
                             let client = AgentClient::with_timeout(&m.ip, port, timeout);
-                            let result = get_runtime().block_on(client.docker_start(&c.container_id));
+                            let result = get_runtime().block_on(client.docker_start(&cid));
                             match result {
                                 Ok(msg) => {
                                     app.nodes = collect_all(&app.config.machines, true);
@@ -1346,14 +1487,21 @@ fn start_tui(nodes: Vec<NodeInfo>, config: Config, refresh_interval: u64) {
                             }
                         }
                     }
-                    KeyCode::Char('t') if app.current_tab == 5 => {
-                        // 停止容器
-                        if let Some((ni, c)) = app.container_at_row(app.selected_row) {
+                    KeyCode::Char('t') if app.current_tab == 5 || app.current_tab == 6 => {
+                        // 停止容器 (tab5 普通容器, tab6 堆栈内容器)
+                        let target = if app.current_tab == 5 {
+                            app.container_at_row(app.selected_row)
+                                .map(|(ni, c)| (ni, c.container_id.clone()))
+                        } else {
+                            app.stack_container_at_row(app.selected_row)
+                                .map(|(ni, c)| (ni, c.container_id.clone()))
+                        };
+                        if let Some((ni, cid)) = target {
                             let m = &app.config.machines[ni];
                             let port = m.agent_port.unwrap_or(50051);
                             let timeout = m.agent_timeout.unwrap_or(30);
                             let client = AgentClient::with_timeout(&m.ip, port, timeout);
-                            let result = get_runtime().block_on(client.docker_stop(&c.container_id));
+                            let result = get_runtime().block_on(client.docker_stop(&cid));
                             match result {
                                 Ok(msg) => {
                                     app.nodes = collect_all(&app.config.machines, true);
@@ -1364,6 +1512,44 @@ fn start_tui(nodes: Vec<NodeInfo>, config: Config, refresh_interval: u64) {
                                     let _ = fs::write("/tmp/node_agent_docker_msg.txt", format!("❌ {}\n", e));
                                 }
                             }
+                        }
+                    }
+                    KeyCode::Char('l') if app.current_tab == 5 || app.current_tab == 6 => {
+                        // 查看容器日志 (tab5 普通容器, tab6 堆栈内容器)
+                        let target = if app.current_tab == 5 {
+                            let c = app.container_at_row(app.selected_row);
+                            c.map(|(ni, c)| {
+                                (ni, c.container_id.clone(), c.name.clone())
+                            })
+                        } else {
+                            app.stack_container_at_row(app.selected_row).map(|(ni, c)| {
+                                (ni, c.container_id.clone(), c.name.clone())
+                            })
+                        };
+                        if let Some((ni, cid, cname)) = target {
+                            let m = &app.config.machines[ni];
+                            let port = m.agent_port.unwrap_or(50051);
+                            let timeout = m.agent_timeout.unwrap_or(30);
+                            let client = AgentClient::with_timeout(&m.ip, port, timeout);
+                            let result = get_runtime().block_on(client.docker_logs(&cid, 200));
+                            let title = format!(" 容器日志 [{}] - {} {} ",
+                                m.name.as_deref().unwrap_or(&m.ip), cname, cid);
+                            let lines: Vec<String> = match result {
+                                Ok((true, logs, _)) => {
+                                    if logs.is_empty() {
+                                        vec!["(无日志输出)".to_string()]
+                                    } else {
+                                        logs.lines().map(|s| s.to_string()).collect()
+                                    }
+                                }
+                                Ok((false, _, errmsg)) => vec![format!("❌ {}", errmsg)],
+                                Err(e) => vec![format!("❌ {}", e)],
+                            };
+                            app.log_popup = Some(LogPopup {
+                                title,
+                                lines,
+                                scroll_offset: 0,
+                            });
                         }
                     }
                     KeyCode::Char('c') if app.current_tab == 6 => {

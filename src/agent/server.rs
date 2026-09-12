@@ -828,6 +828,50 @@ impl NodeAgent for NodeAgentService {
         }
     }
 
+    async fn docker_logs(
+        &self,
+        request: Request<DockerLogsRequest>,
+    ) -> Result<Response<DockerLogsResponse>, Status> {
+        let req = request.into_inner();
+        let container_id = req.container_id.trim();
+        if container_id.is_empty() {
+            return Ok(Response::new(DockerLogsResponse {
+                success: false,
+                logs: String::new(),
+                message: "容器 ID 为空".into(),
+            }));
+        }
+        // shell 转义容器 ID
+        let escaped = container_id.replace('\'', "'\\''");
+        let tail = if req.tail > 0 { req.tail } else { 200 };
+        let cmd = format!(
+            "docker logs --tail {} '{}' 2>&1 2>/dev/null || docker logs '{}' 2>&1",
+            tail, escaped, escaped
+        );
+        match Self::run_command(&cmd) {
+            Ok((code, ref out, _)) => {
+                if code == 0 {
+                    Ok(Response::new(DockerLogsResponse {
+                        success: true,
+                        logs: out.clone(),
+                        message: String::new(),
+                    }))
+                } else {
+                    Ok(Response::new(DockerLogsResponse {
+                        success: false,
+                        logs: String::new(),
+                        message: format!("获取日志失败: {}", out),
+                    }))
+                }
+            }
+            Err(e) => Ok(Response::new(DockerLogsResponse {
+                success: false,
+                logs: String::new(),
+                message: e,
+            })),
+        }
+    }
+
     type WatchEventsStream = ReceiverStream<Result<NodeEvent, Status>>;
 
     async fn watch_events(
