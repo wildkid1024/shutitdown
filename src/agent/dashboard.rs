@@ -96,6 +96,23 @@ struct StackInfo {
 }
 
 #[derive(Debug, Clone, Default)]
+struct ModelInstance {
+    container_id: String,
+    name: String,
+    image: String,
+    status: String,
+    endpoint: String,
+    device: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ModelInfo {
+    category: String,
+    name: String,
+    instances: Vec<ModelInstance>,
+}
+
+#[derive(Debug, Clone, Default)]
 struct CpuDetail {
     model: String,
     cores: i32,
@@ -122,6 +139,7 @@ struct NodeInfo {
     disks: Vec<DiskInfo>,
     containers: Vec<ContainerInfo>,
     stacks: Vec<StackInfo>,
+    models: Vec<ModelInfo>,
     uptime: String,
     load_avg: String,
     agent_version: String,
@@ -142,6 +160,7 @@ impl Default for NodeInfo {
             disks: vec![],
             containers: vec![],
             stacks: vec![],
+            models: vec![],
             uptime: String::new(),
             load_avg: String::new(),
             agent_version: String::new(),
@@ -245,6 +264,26 @@ fn collect_via_grpc(m: &Machine) -> NodeInfo {
                     })
                     .collect();
 
+                let models = pb
+                    .models
+                    .iter()
+                    .map(|m| {
+                        let instances = m.instances.iter().map(|i| ModelInstance {
+                            container_id: i.container_id.clone(),
+                            name: i.name.clone(),
+                            image: i.image.clone(),
+                            status: i.status.clone(),
+                            endpoint: i.endpoint.clone(),
+                            device: i.device.clone(),
+                        }).collect();
+                        ModelInfo {
+                            category: m.category.clone(),
+                            name: m.name.clone(),
+                            instances,
+                        }
+                    })
+                    .collect();
+
                 let mem = pb.memory.unwrap_or_default();
 
                 NodeInfo {
@@ -267,6 +306,7 @@ fn collect_via_grpc(m: &Machine) -> NodeInfo {
                     disks,
                     containers,
                     stacks,
+                    models,
                     uptime: pb.uptime,
                     load_avg: pb.load_avg,
                     agent_version: pb.agent_version,
@@ -287,7 +327,7 @@ fn collect_via_grpc(m: &Machine) -> NodeInfo {
 
 // ==================== TUI 应用 ====================
 
-const TAB_NAMES: &[&str] = &["总览", "CPU", "内存", "显卡", "磁盘", "容器", "堆栈"];
+const TAB_NAMES: &[&str] = &["总览", "CPU", "内存", "显卡", "磁盘", "容器", "堆栈", "模型"];
 
 /// 日志弹窗状态
 struct LogPopup {
@@ -368,8 +408,81 @@ impl App {
                 }
                 n
             }
+            7 => {
+                let mut n = 0;
+                for node in &self.nodes {
+                    if node.models.is_empty() {
+                        continue;
+                    }
+                    n += 1; // 节点行
+                    if self.collapsed_nodes.contains(&node.name) {
+                        continue;
+                    }
+                    for cat in Self::model_categories() {
+                        let cat_models: Vec<&ModelInfo> =
+                            node.models.iter().filter(|m| m.category == cat).collect();
+                        if cat_models.is_empty() {
+                            continue;
+                        }
+                        n += 1; // 分类行
+                        for m in &cat_models {
+                            n += 1; // 模型行
+                            n += m.instances.len(); // 实例行
+                        }
+                    }
+                }
+                n
+            }
             _ => 0,
         }
+    }
+
+    /// 模型分类固定顺序
+    fn model_categories() -> [&'static str; 4] {
+        ["chat", "embedding", "rerank", "speech"]
+    }
+
+    /// 分类中文名
+    fn category_label(cat: &str) -> &'static str {
+        match cat {
+            "chat" => "对话 (大模型)",
+            "embedding" => "嵌入",
+            "rerank" => "重排",
+            "speech" => "语音",
+            _ => "其他",
+        }
+    }
+
+    /// 模型 tab 中某行所属的节点名
+    fn node_name_at_model_row(&self, row: usize) -> Option<String> {
+        let mut r = 0;
+        for node in &self.nodes {
+            if node.models.is_empty() {
+                continue;
+            }
+            if r == row {
+                return Some(node.name.clone());
+            }
+            r += 1;
+            if self.collapsed_nodes.contains(&node.name) {
+                continue;
+            }
+            for cat in Self::model_categories() {
+                let cat_models: Vec<&ModelInfo> =
+                    node.models.iter().filter(|m| m.category == cat).collect();
+                if cat_models.is_empty() {
+                    continue;
+                }
+                r += 1;
+                for m in &cat_models {
+                    r += 1 + m.instances.len();
+                    if r > row {
+                        return Some(node.name.clone());
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn select_next(&mut self) {
@@ -410,6 +523,7 @@ impl App {
             4 => self.node_name_at_disk_row(self.selected_row),
             5 => self.node_name_at_container_row(self.selected_row),
             6 => self.node_name_at_stack_row(self.selected_row),
+            7 => self.node_name_at_model_row(self.selected_row),
             _ => None,
         };
         if let Some(name) = name {
@@ -648,6 +762,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             4 => render_disk(f, chunks[1], app),
             5 => render_containers(f, chunks[1], app),
             6 => render_stacks(f, chunks[1], app),
+            7 => render_models(f, chunks[1], app),
             _ => {}
         }
 
@@ -1269,6 +1384,149 @@ fn render_stacks(f: &mut Frame, area: Rect, app: &App) {
         Table::new(visible_rows, &widths)
             .header(header_row)
             .block(Block::default().borders(Borders::ALL).title(" 堆栈信息（Enter/Space 折叠/展开节点，c 启动堆栈，d 停止堆栈） ")),
+        area,
+    );
+}
+
+fn render_models(f: &mut Frame, area: Rect, app: &App) {
+    let headers = vec!["节点/分类/模型", "实例", "镜像", "状态", "设备", "地址"];
+    let widths = [
+        Constraint::Length(34),
+        Constraint::Length(26),
+        Constraint::Length(34),
+        Constraint::Length(10),
+        Constraint::Length(8),
+        Constraint::Length(22),
+    ];
+
+    let header_cells = headers
+        .iter()
+        .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
+    let header_row = Row::new(header_cells).style(Style::default().bg(Color::DarkGray));
+
+    let mut rows = Vec::new();
+    let mut row_idx = 0usize;
+    for n in &app.nodes {
+        if n.models.is_empty() {
+            continue;
+        }
+        let collapsed = app.collapsed_nodes.contains(&n.name);
+        let total_inst: usize = n.models.iter().map(|m| m.instances.len()).sum();
+        let summary = if collapsed {
+            format!(" ▶ {} ({}模型/{}实例)", n.name, n.models.len(), total_inst)
+        } else {
+            format!(" ▼ {} ({}模型/{}实例)", n.name, n.models.len(), total_inst)
+        };
+        let is_selected = row_idx == app.selected_row;
+        let summary_style = if is_selected {
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)
+        };
+        rows.push(
+            Row::new(vec![
+                Cell::from(Span::styled(summary, summary_style)),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+            ])
+            .style(if is_selected { Style::default().bg(Color::Blue) } else { Style::default() }),
+        );
+        row_idx += 1;
+
+        if collapsed {
+            continue;
+        }
+
+        for cat in App::model_categories() {
+            let cat_models: Vec<&ModelInfo> =
+                n.models.iter().filter(|m| m.category == cat).collect();
+            if cat_models.is_empty() {
+                continue;
+            }
+            // 分类行
+            let is_selected = row_idx == app.selected_row;
+            let cat_style = if is_selected {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            };
+            let cat_label = format!("  {}", App::category_label(cat));
+            rows.push(
+                Row::new(vec![
+                    Cell::from(Span::styled(cat_label, cat_style)),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                ])
+                .style(if is_selected { Style::default().bg(Color::Blue) } else { Style::default() }),
+            );
+            row_idx += 1;
+
+            // 模型行 + 实例行
+            for m in &cat_models {
+                let is_selected = row_idx == app.selected_row;
+                let model_style = if is_selected {
+                    Style::default().bg(Color::Blue).fg(Color::White)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                let model_label = format!("    {}", m.name);
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(Span::styled(model_label, model_style)),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                    ])
+                    .style(if is_selected { Style::default().bg(Color::Blue) } else { Style::default() }),
+                );
+                row_idx += 1;
+
+                for i in &m.instances {
+                    let is_selected = row_idx == app.selected_row;
+                    let row_style = if is_selected {
+                        Style::default().bg(Color::Blue).fg(Color::White)
+                    } else {
+                        Style::default()
+                    };
+                    let inst_text = if i.name.is_empty() {
+                        i.container_id.clone()
+                    } else {
+                        format!("{} ({})", i.container_id, i.name)
+                    };
+                    rows.push(
+                        Row::new(vec![
+                            Cell::from(""),
+                            Cell::from(inst_text),
+                            Cell::from(i.image.as_str()),
+                            Cell::from(i.status.as_str()),
+                            Cell::from(i.device.as_str()),
+                            Cell::from(i.endpoint.as_str()),
+                        ])
+                        .style(row_style),
+                    );
+                    row_idx += 1;
+                }
+            }
+        }
+    }
+
+    let start = app.scroll_offset;
+    let visible_rows: Vec<Row> = rows.into_iter().skip(start).take(100).collect();
+    f.render_widget(
+        Table::new(visible_rows, &widths)
+            .header(header_row)
+            .block(Block::default().borders(Borders::ALL).title(" 模型列表（ Enter/Space 折叠/展开节点 ） ")),
         area,
     );
 }

@@ -328,6 +328,184 @@ impl NodeAgentService {
         }
     }
 
+    /// 按模型名判断分类 (chat/embedding/rerank/speech)
+    fn classify_model_name(name: &str) -> &'static str {
+        let n = name.to_lowercase();
+        if n.contains("rerank") || n.contains("reranker") {
+            return "rerank";
+        }
+        if n.contains("embedding") || n.contains("text-embedding")
+            || n.contains("m3e") || n.contains("gte") || n.contains("e5-")
+            || n.starts_with("bge") || n.contains("sentence-transform") {
+            return "embedding";
+        }
+        if n.contains("whisper") || n.contains("asr") || n.contains("tts")
+            || n.contains("cosyvoice") || n.contains("voice") || n.contains("funasr") {
+            return "speech";
+        }
+        "chat"
+    }
+
+    /// 探测容器端口是否为推理服务，返回 (是否模型服务, 模型名列表)
+    /// 只有能成功访问推理框架 API 并解析出模型列表的才算模型服务
+    fn probe_model_names(host_port: u64) -> (bool, Vec<String>) {
+        // 1) OpenAI 兼容 (/v1/models) —— vLLM/TGI/SGLang/llama.cpp 等
+        let oai = format!(
+            "curl -s -m 2 http://127.0.0.1:{}/v1/models 2>/dev/null || echo 'ERR'",
+            host_port
+        );
+        if let Ok((code, ref out, _)) = Self::run_command(&oai) {
+            if code == 0 && out != "ERR" && !out.is_empty() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(out) {
+                    let ids: Vec<String> = v.get("data").and_then(|d| d.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !ids.is_empty() {
+                        return (true, ids);
+                    }
+                }
+            }
+        }
+        // 2) Ollama (/api/tags)
+        let ollama = format!(
+            "curl -s -m 2 http://127.0.0.1:{}/api/tags 2>/dev/null || echo 'ERR'",
+            host_port
+        );
+        if let Ok((code, ref out, _)) = Self::run_command(&ollama) {
+            if code == 0 && out != "ERR" && !out.is_empty() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(out) {
+                    let names: Vec<String> = v.get("models").and_then(|m| m.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !names.is_empty() {
+                        return (true, names);
+                    }
+                }
+            }
+        }
+        (false, vec![])
+    }
+
+    /// 采集模型服务 (只收录能访问推理框架 URL 的容器，按模型名分类)
+    fn collect_models() -> Vec<ModelInfo> {
+        let socket_path = "/var/run/docker.sock";
+        if !std::path::Path::new(socket_path).exists() {
+            return vec![];
+        }
+        let _t = Instant::now();
+
+        let output = match Command::new("curl")
+            .args([
+                "-s",
+                "--unix-socket", socket_path,
+                "http://localhost/containers/json?all=true",
+            ])
+            .output() {
+            Ok(o) if o.status.success() => o,
+            _ => return vec![],
+        };
+        let body = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let containers: Vec<serde_json::Value> = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => return vec![],
+        };
+
+        let mut models: Vec<ModelInfo> = Vec::new();
+        for c in &containers {
+            // 只看运行中的容器
+            if c.get("State").and_then(|s| s.as_str()) != Some("running") {
+                continue;
+            }
+            let image = c.get("Image").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            let cid = c.get("Id").and_then(|s| s.as_str()).unwrap_or("")
+                .chars().take(12).collect::<String>();
+            let cname = c.get("Names").and_then(|a| a.as_array())
+                .and_then(|a| a.first()).and_then(|s| s.as_str())
+                .map(|s| s.trim_start_matches('/').to_string())
+                .unwrap_or_default();
+
+            // 提取宿主机映射端口
+            let host_port = c.get("Ports").and_then(|p| p.as_array())
+                .and_then(|arr| arr.iter().find_map(|x| x.get("PublicPort").and_then(|p| p.as_u64())))
+                .unwrap_or(0);
+            if host_port == 0 {
+                continue; // 无端口可访问，无法探测
+            }
+
+            // 核心判定：能否访问推理框架 URL
+            let (is_model, names) = Self::probe_model_names(host_port);
+            if !is_model {
+                continue; // 不是推理服务，排除
+            }
+
+            let device = Self::container_device(c);
+            let endpoint = format!("127.0.0.1:{}", host_port);
+
+            // 探测出的模型名，若为空则用容器名兜底
+            let model_names: Vec<String> = if names.is_empty() {
+                vec![cname.clone()]
+            } else {
+                names
+            };
+
+            for model_name in model_names {
+                let category = Self::classify_model_name(&model_name);
+                // 归类 (同一分类+模型名合并实例)
+                if let Some(m) = models.iter_mut().find(|m| m.category == category && m.name == model_name) {
+                    m.instances.push(ModelInstance {
+                        container_id: cid.clone(),
+                        name: cname.clone(),
+                        image: image.clone(),
+                        status: "running".into(),
+                        endpoint: endpoint.clone(),
+                        device: device.clone(),
+                    });
+                } else {
+                    models.push(ModelInfo {
+                        category: category.into(),
+                        name: model_name,
+                        instances: vec![ModelInstance {
+                            container_id: cid.clone(),
+                            name: cname.clone(),
+                            image: image.clone(),
+                            status: "running".into(),
+                            endpoint: endpoint.clone(),
+                            device: device.clone(),
+                        }],
+                    });
+                }
+            }
+        }
+
+        // 排序: 分类固定顺序
+        let order = ["chat", "embedding", "rerank", "speech"];
+        models.sort_by_key(|m| {
+            order.iter().position(|c| *c == m.category).unwrap_or(99)
+        });
+        Self::debug_log(format!("collect_models: {}ms, count={}", _t.elapsed().as_millis(), models.len()));
+        models
+    }
+
+    /// 尝试从容器标签读取 GPU 设备索引
+    fn container_device(c: &serde_json::Value) -> String {
+        let labels = c.get("Labels").and_then(|l| l.as_object());
+        let mut dev = String::new();
+        for key in ["gpu", "gpus", "cuda", "device", "nvidia.com/gpu"] {
+            if let Some(v) = labels.and_then(|l| l.get(key)).and_then(|v| v.as_str()) {
+                if !v.is_empty() { dev = v.to_string(); break; }
+            }
+        }
+        dev
+    }
+
     /// 格式化 Docker 端口映射
     fn format_docker_ports(ports: Option<&Vec<serde_json::Value>>) -> String {
         let ports = match ports {
@@ -393,6 +571,10 @@ impl NodeAgentService {
         Self::debug_log(format!("collect_stacks: {}ms, count={}", _t.elapsed().as_millis(), stacks.len()));
 
         let _t = Instant::now();
+        let models = Self::collect_models();
+        Self::debug_log(format!("collect_models: {}ms, count={}", _t.elapsed().as_millis(), models.len()));
+
+        let _t = Instant::now();
         let disks = Self::collect_disks_debug();
         Self::debug_log(format!("collect_disks: {}ms, count={}", _t.elapsed().as_millis(), disks.len()));
 
@@ -429,6 +611,7 @@ impl NodeAgentService {
             containers,
             disks,
             stacks,
+            models,
             uptime,
             load_avg: load,
             agent_version: env!("CARGO_PKG_VERSION").to_string(),

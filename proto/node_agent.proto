@@ -74,6 +74,27 @@ message NodeInfo {
   int64 uptime_seconds = 12;
   repeated ContainerInfo containers = 13;
   repeated StackInfo stacks = 14;
+  repeated ModelInfo models = 15;
+}
+
+message ModelInfo {
+  // 分类: chat / embedding / rerank / speech
+  string category = 1;
+  // 模型名称
+  string name = 2;
+  // 可用状态的运行实例
+  repeated ModelInstance instances = 3;
+}
+
+message ModelInstance {
+  string container_id = 1;
+  string name = 2;
+  string image = 3;
+  string status = 4;
+  // 服务地址 host:port
+  string endpoint = 5;
+  // 运行 GPU 设备 (如 0,1)
+  string device = 6;
 }
 
 message ContainerInfo {
