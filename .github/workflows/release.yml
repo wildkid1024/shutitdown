@@ -1,0 +1,227 @@
+name: Release (tag 版本打包)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '手动触发时的版本号 (如 1.2.0)'
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+            cc_pkg: musl-tools
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            cc_pkg: gcc-aarch64-linux-gnu
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 解析版本号 (从 tag 提取，剥离 v 前缀)
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VER="${{ github.event.inputs.version }}"
+          else
+            VER="${GITHUB_REF_NAME#v}"
+          fi
+          VER="${VER#v}"
+          VER="${VER:-0.0.0}"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          echo "解析版本: $VER (tag: $GITHUB_REF_NAME)"
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 安装交叉编译工具链
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cc_pkg }} libssl-dev pkg-config
+
+      - name: 缓存 Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: 编译 ${{ matrix.arch }} (release, musl)
+        run: |
+          cargo build --release --target ${{ matrix.target }} --bin node-agent \
+            --bin node_info --bin batch_shutdown
+
+      - name: 收集二进制产物
+        shell: bash
+        run: |
+          mkdir -p dist/bin
+          for b in node-agent node_info batch_shutdown; do
+            if [ -x "target/${{ matrix.target }}/release/$b" ]; then
+              cp "target/${{ matrix.target }}/release/$b" "dist/bin/$b"
+            fi
+          done
+          # 附带示例配置文件与 systemd 服务
+          cp -f agent.toml dist/ 2>/dev/null || true
+          cp -f config.toml dist/ 2>/dev/null || true
+          cp -f packaging/node-agent.service dist/ 2>/dev/null || true
+          cp -f README.md dist/ 2>/dev/null || true
+
+      - name: 打包二进制压缩包
+        shell: bash
+        run: |
+          VER="${{ steps.version.outputs.version }}"
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          tar -czf "$RUNNER_TEMP/artifacts/shutitdown-${{ matrix.arch }}-$VER.tar.gz" -C dist .
+          echo "产物: $RUNNER_TEMP/artifacts/shutitdown-${{ matrix.arch }}-$VER.tar.gz"
+
+      - name: 上传压缩包 (workflow artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: shutitdown-${{ matrix.arch }}
+          path: ${{ runner.temp }}/artifacts/shutitdown-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz
+
+  rpm:
+    name: 打包 RPM (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+            cc_pkg: musl-tools
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            cc_pkg: gcc-aarch64-linux-gnu
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 解析版本号
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VER="${{ github.event.inputs.version }}"
+          else
+            VER="${GITHUB_REF_NAME#v}"
+          fi
+          VER="${VER#v}"
+          VER="${VER:-0.0.0}"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 安装交叉编译工具链
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cc_pkg }} libssl-dev pkg-config
+
+      - name: 缓存 Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: 编译 ${{ matrix.arch }} (release, musl)
+        run: |
+          cargo build --release --target ${{ matrix.target }} --bin node-agent \
+            --bin node_info --bin batch_shutdown
+
+      - name: 安装 rpm 打包依赖 + fpm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm
+          gem install --no-document fpm
+
+      - name: 用 package-rpm.sh 打包 RPM
+        shell: bash
+        run: |
+          ./package-rpm.sh ${{ matrix.arch }} "${{ steps.version.outputs.version }}"
+
+      - name: 收集 RPM
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          cp -f dist/*.rpm "$RUNNER_TEMP/artifacts/"
+          ls -la "$RUNNER_TEMP/artifacts/"
+
+      - name: 上传 RPM (workflow artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.arch }}
+          path: ${{ runner.temp }}/artifacts/*.rpm
+
+  release:
+    name: 发布 GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build, rpm]
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 解析版本号
+        id: version
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          VER="${VER:-0.0.0}"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: 下载所有产物
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/release-assets
+          merge-multiple: true
+
+      - name: 列出待发布文件
+        shell: bash
+        run: |
+          ls -la "$RUNNER_TEMP/release-assets/"
+
+      - name: 创建 / 更新 GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          body: |
+            ## shutitdown ${{ steps.version.outputs.version }}
+
+            - 架构: amd64 (x86_64) / aarch64 (arm64)，静态 musl 编译
+            - 包含: node-agent / node_info / batch_shutdown
+            - 打包: RPM 包 + 二进制压缩包
+          files: |
+            ${{ runner.temp }}/release-assets/**
+          generate_release_notes: true
