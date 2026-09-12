@@ -1,0 +1,15 @@
+[Unit]
+Description=Node Agent gRPC Server
+Documentation=https://github.com/wildkid1024/batch_shutdown
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/node-agent serve
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
