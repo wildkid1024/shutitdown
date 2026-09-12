@@ -329,11 +329,19 @@ fn collect_via_grpc(m: &Machine) -> NodeInfo {
 
 const TAB_NAMES: &[&str] = &["总览", "CPU", "内存", "显卡", "磁盘", "容器", "堆栈", "模型"];
 
-/// 日志弹窗状态
+/// 日志/测试弹窗状态
 struct LogPopup {
     title: String,
     lines: Vec<String>,
     scroll_offset: usize,
+}
+
+/// 模型 tab 行类型
+enum ModelRowKind<'a> {
+    Node(usize),
+    Category,
+    Model(usize, &'a ModelInfo),
+    Instance(usize, &'a ModelInstance),
 }
 
 struct App {
@@ -345,7 +353,9 @@ struct App {
     collapsed_nodes: HashSet<String>,
     /// 折叠的堆栈 key: 格式 "node名\0项目名"
     collapsed_stacks: HashSet<String>,
-    /// 日志弹窗 (None 表示未打开)
+    /// 折叠的模型 key: 格式 "node名\0模型名"
+    collapsed_models: HashSet<String>,
+    /// 日志/测试弹窗 (None 表示未打开)
     log_popup: Option<LogPopup>,
     last_refresh: String,
 }
@@ -427,7 +437,9 @@ impl App {
                         n += 1; // 分类行
                         for m in &cat_models {
                             n += 1; // 模型行
-                            n += m.instances.len(); // 实例行
+                            if !self.model_is_collapsed(&node.name, &m.name) {
+                                n += m.instances.len(); // 实例行
+                            }
                         }
                     }
                 }
@@ -473,9 +485,12 @@ impl App {
                 if cat_models.is_empty() {
                     continue;
                 }
-                r += 1;
+                r += 1; // 分类行
                 for m in &cat_models {
-                    r += 1 + m.instances.len();
+                    r += 1; // 模型行
+                    if !self.model_is_collapsed(&node.name, &m.name) {
+                        r += m.instances.len();
+                    }
                     if r > row {
                         return Some(node.name.clone());
                     }
@@ -483,6 +498,80 @@ impl App {
             }
         }
         None
+    }
+
+    /// 获取模型 tab 中某行对应的模型 (节点 index, 模型引用)
+    fn model_at_row(&self, row: usize) -> Option<(usize, &ModelInfo)> {
+        let mut r = 0;
+        for (ni, node) in self.nodes.iter().enumerate() {
+            if node.models.is_empty() {
+                continue;
+            }
+            r += 1; // 节点行
+            if self.collapsed_nodes.contains(&node.name) {
+                continue;
+            }
+            for cat in Self::model_categories() {
+                let cat_models: Vec<&ModelInfo> =
+                    node.models.iter().filter(|m| m.category == cat).collect();
+                if cat_models.is_empty() {
+                    continue;
+                }
+                r += 1; // 分类行
+                for m in &cat_models {
+                    if r == row {
+                        return Some((ni, m));
+                    }
+                    r += 1; // 模型行
+                    if !self.model_is_collapsed(&node.name, &m.name) {
+                        r += m.instances.len();
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 获取模型 tab 中某行对应的实例 (节点 index, 实例引用)
+    fn model_instance_at_row(&self, row: usize) -> Option<(usize, &ModelInstance)> {
+        let mut r = 0;
+        for (ni, node) in self.nodes.iter().enumerate() {
+            if node.models.is_empty() {
+                continue;
+            }
+            r += 1; // 节点行
+            if self.collapsed_nodes.contains(&node.name) {
+                continue;
+            }
+            for cat in Self::model_categories() {
+                let cat_models: Vec<&ModelInfo> =
+                    node.models.iter().filter(|m| m.category == cat).collect();
+                if cat_models.is_empty() {
+                    continue;
+                }
+                r += 1; // 分类行
+                for m in &cat_models {
+                    r += 1; // 模型行
+                    if !self.model_is_collapsed(&node.name, &m.name) {
+                        for inst in &m.instances {
+                            if r == row {
+                                return Some((ni, inst));
+                            }
+                            r += 1;
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn model_key(node: &str, model: &str) -> String {
+        format!("{}\u{0}{}", node, model)
+    }
+
+    fn model_is_collapsed(&self, node: &str, model: &str) -> bool {
+        self.collapsed_models.contains(&Self::model_key(node, model))
     }
 
     fn select_next(&mut self) {
@@ -514,6 +603,19 @@ impl App {
                     self.collapsed_stacks.remove(&key);
                 } else {
                     self.collapsed_stacks.insert(key);
+                }
+                return;
+            }
+        }
+        // 模型 tab：优先折叠/展开模型，其次折叠/展开节点（分类行不可折叠）
+        if self.current_tab == 7 {
+            if let Some((ni, m)) = self.model_at_row(self.selected_row) {
+                let node = &self.nodes[ni];
+                let key = Self::model_key(&node.name, &m.name);
+                if self.collapsed_models.contains(&key) {
+                    self.collapsed_models.remove(&key);
+                } else {
+                    self.collapsed_models.insert(key);
                 }
                 return;
             }
@@ -736,6 +838,57 @@ fn pct_color(pct: f64) -> Color {
     else { Color::Green }
 }
 
+/// 经 agent 在目标节点执行 curl，测试模型端点连通性与速度
+fn test_model_endpoint_remote(ip: &str, port: u16, timeout_secs: u64, endpoint: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    if endpoint.is_empty() {
+        lines.push("❌ 无端点信息".to_string());
+        return lines;
+    }
+    // 探测 /v1/models
+    let cmd = format!(
+        "curl -s -o /dev/null -m 5 -w 'HTTP:%{{http_code}} 连接:%{{time_connect}}s TTFB:%{{time_starttransfer}}s 总耗时:%{{time_total}}s' http://{}/v1/models 2>&1",
+        endpoint
+    );
+    let client = AgentClient::with_timeout(ip, port, timeout_secs);
+    lines.push(format!("目标: {}", endpoint));
+    match get_runtime().block_on(client.exec(&cmd, 10)) {
+        Ok((code, stdout, stderr)) => {
+            if code == 0 {
+                lines.push(format!("✅ /v1/models 连通: {}", stdout.trim()));
+                lines.push("".to_string());
+                lines.push("— 延迟采样 (3次) —".to_string());
+                for k in 1..=3 {
+                    let cmd2 = format!(
+                        "curl -s -o /dev/null -m 5 -w '{}: HTTP:%{{http_code}} %{{time_total}}s' http://{}/v1/models 2>&1",
+                        k, endpoint
+                    );
+                    let c2 = AgentClient::with_timeout(ip, port, timeout_secs);
+                    match get_runtime().block_on(c2.exec(&cmd2, 10)) {
+                        Ok((_, o, _)) => lines.push(format!("  {}", o.trim().to_string())),
+                        Err(e) => lines.push(format!("  ❌ {}", e)),
+                    }
+                }
+            } else {
+                lines.push(format!("⚠️ 无法访问 /v1/models (退出码 {}): {}", code, stderr.trim()));
+                lines.push("".to_string());
+                lines.push("— 尝试根路径 / —".to_string());
+                let cmd3 = format!(
+                    "curl -s -o /dev/null -m 5 -w 'HTTP:%{{http_code}} %{{time_total}}s' http://{} 2>&1",
+                    endpoint
+                );
+                let c3 = AgentClient::with_timeout(ip, port, timeout_secs);
+                match get_runtime().block_on(c3.exec(&cmd3, 10)) {
+                    Ok((_, o, _)) => lines.push(format!("  根路径: {}", o.trim().to_string())),
+                    Err(e) => lines.push(format!("  ❌ {}", e)),
+                }
+            }
+        }
+        Err(e) => lines.push(format!("❌ 执行失败: {}", e)),
+    }
+    lines
+}
+
 // ==================== 渲染 ====================
 
 fn ui(f: &mut Frame, app: &mut App) {
@@ -769,9 +922,10 @@ fn ui(f: &mut Frame, app: &mut App) {
     let footer = Line::from(vec![
         Span::styled(" ←→切换Tab ", Style::default().fg(Color::Cyan)),
         Span::styled(" ↑↓滚动 ", Style::default().fg(Color::Cyan)),
-        Span::styled(" Enter/Space折叠(节点/堆栈) ", Style::default().fg(Color::Yellow)),
-        Span::styled(" 容器/堆栈Tab: s启动/t停止容器 l日志 ", Style::default().fg(Color::Green)),
-        Span::styled(" 堆栈行: c启动/d停止堆栈 ", Style::default().fg(Color::Magenta)),
+        Span::styled(" Enter折叠(节点/堆栈/模型) ", Style::default().fg(Color::Yellow)),
+        Span::styled(" 容器/堆栈/模型Tab: l日志 ", Style::default().fg(Color::Green)),
+        Span::styled(" 堆栈行: c/d堆栈 容器s/t ", Style::default().fg(Color::Magenta)),
+        Span::styled(" 模型Tab: v测速 ", Style::default().fg(Color::Cyan)),
         Span::styled(" r刷新 ", Style::default().fg(Color::Green)),
         Span::styled(" q退出 ", Style::default().fg(Color::Cyan)),
     ]);
@@ -1472,13 +1626,15 @@ fn render_models(f: &mut Frame, area: Rect, app: &App) {
 
             // 模型行 + 实例行
             for m in &cat_models {
+                let model_collapsed = app.model_is_collapsed(&n.name, &m.name);
                 let is_selected = row_idx == app.selected_row;
                 let model_style = if is_selected {
                     Style::default().bg(Color::Blue).fg(Color::White)
                 } else {
                     Style::default().fg(Color::Cyan)
                 };
-                let model_label = format!("    {}", m.name);
+                let arrow = if model_collapsed { "▶" } else { "▼" };
+                let model_label = format!("    {} {} ({}实例)", arrow, m.name, m.instances.len());
                 rows.push(
                     Row::new(vec![
                         Cell::from(Span::styled(model_label, model_style)),
@@ -1492,30 +1648,32 @@ fn render_models(f: &mut Frame, area: Rect, app: &App) {
                 );
                 row_idx += 1;
 
-                for i in &m.instances {
-                    let is_selected = row_idx == app.selected_row;
-                    let row_style = if is_selected {
-                        Style::default().bg(Color::Blue).fg(Color::White)
-                    } else {
-                        Style::default()
-                    };
-                    let inst_text = if i.name.is_empty() {
-                        i.container_id.clone()
-                    } else {
-                        format!("{} ({})", i.container_id, i.name)
-                    };
-                    rows.push(
-                        Row::new(vec![
-                            Cell::from(""),
-                            Cell::from(inst_text),
-                            Cell::from(i.image.as_str()),
-                            Cell::from(i.status.as_str()),
-                            Cell::from(i.device.as_str()),
-                            Cell::from(i.endpoint.as_str()),
-                        ])
-                        .style(row_style),
-                    );
-                    row_idx += 1;
+                if !model_collapsed {
+                    for i in &m.instances {
+                        let is_selected = row_idx == app.selected_row;
+                        let row_style = if is_selected {
+                            Style::default().bg(Color::Blue).fg(Color::White)
+                        } else {
+                            Style::default()
+                        };
+                        let inst_text = if i.name.is_empty() {
+                            i.container_id.clone()
+                        } else {
+                            format!("{} ({})", i.container_id, i.name)
+                        };
+                        rows.push(
+                            Row::new(vec![
+                                Cell::from(""),
+                                Cell::from(inst_text),
+                                Cell::from(i.image.as_str()),
+                                Cell::from(i.status.as_str()),
+                                Cell::from(i.device.as_str()),
+                                Cell::from(i.endpoint.as_str()),
+                            ])
+                            .style(row_style),
+                        );
+                        row_idx += 1;
+                    }
                 }
             }
         }
@@ -1636,6 +1794,7 @@ fn start_tui(nodes: Vec<NodeInfo>, config: Config, refresh_interval: u64) {
         selected_row: 0,
         collapsed_nodes: HashSet::new(),
         collapsed_stacks: HashSet::new(),
+        collapsed_models: HashSet::new(),
         log_popup: None,
         last_refresh: Local::now().format("%H:%M:%S").to_string(),
     };
@@ -1772,17 +1931,17 @@ fn start_tui(nodes: Vec<NodeInfo>, config: Config, refresh_interval: u64) {
                             }
                         }
                     }
-                    KeyCode::Char('l') if app.current_tab == 5 || app.current_tab == 6 => {
-                        // 查看容器日志 (tab5 普通容器, tab6 堆栈内容器)
+                    KeyCode::Char('l') if app.current_tab == 5 || app.current_tab == 6 || app.current_tab == 7 => {
+                        // 查看容器日志 (tab5 容器, tab6 堆栈容器, tab7 模型实例)
                         let target = if app.current_tab == 5 {
-                            let c = app.container_at_row(app.selected_row);
-                            c.map(|(ni, c)| {
-                                (ni, c.container_id.clone(), c.name.clone())
-                            })
+                            app.container_at_row(app.selected_row)
+                                .map(|(ni, c)| (ni, c.container_id.clone(), c.name.clone()))
+                        } else if app.current_tab == 6 {
+                            app.stack_container_at_row(app.selected_row)
+                                .map(|(ni, c)| (ni, c.container_id.clone(), c.name.clone()))
                         } else {
-                            app.stack_container_at_row(app.selected_row).map(|(ni, c)| {
-                                (ni, c.container_id.clone(), c.name.clone())
-                            })
+                            app.model_instance_at_row(app.selected_row)
+                                .map(|(ni, i)| (ni, i.container_id.clone(), i.name.clone()))
                         };
                         if let Some((ni, cid, cname)) = target {
                             let m = &app.config.machines[ni];
@@ -1808,6 +1967,18 @@ fn start_tui(nodes: Vec<NodeInfo>, config: Config, refresh_interval: u64) {
                                 lines,
                                 scroll_offset: 0,
                             });
+                        }
+                    }
+                    KeyCode::Char('v') if app.current_tab == 7 => {
+                        // 模型实例连通性/速度测试 (经 agent 在目标节点执行 curl)
+                        if let Some((ni, i)) = app.model_instance_at_row(app.selected_row) {
+                            let m = &app.config.machines[ni];
+                            let port = m.agent_port.unwrap_or(50051);
+                            let timeout = m.agent_timeout.unwrap_or(30);
+                            let title = format!(" 连通性/速度测试 [{}] - {} {} ",
+                                m.name.as_deref().unwrap_or(&m.ip), i.name, i.endpoint);
+                            let lines = test_model_endpoint_remote(&m.ip, port, timeout, &i.endpoint);
+                            app.log_popup = Some(LogPopup { title, lines, scroll_offset: 0 });
                         }
                     }
                     KeyCode::Char('c') if app.current_tab == 6 => {
