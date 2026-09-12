@@ -450,8 +450,8 @@ impl App {
     }
 
     /// 模型分类固定顺序
-    fn model_categories() -> [&'static str; 4] {
-        ["chat", "embedding", "rerank", "speech"]
+    fn model_categories() -> [&'static str; 5] {
+        ["chat", "embedding", "rerank", "speech", "image"]
     }
 
     /// 分类中文名
@@ -461,6 +461,7 @@ impl App {
             "embedding" => "嵌入",
             "rerank" => "重排",
             "speech" => "语音",
+            "image" => "图像 (OCR/视觉)",
             _ => "其他",
         }
     }

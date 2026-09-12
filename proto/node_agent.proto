@@ -47,7 +47,7 @@ service NodeAgent {
 // 模型部署规格 —— 引用外部 docker-compose 文件 + 实例参数
 message ModelDeploySpec {
   string name = 1;              // 模型/堆栈基础名 (compost project 基础名)
-  string category = 2;          // chat / embedding / rerank / speech
+  string category = 2;          // chat / embedding / rerank / speech / image
   int32 index = 3;              // 实例序号 (从 1 开始); 0 表示单实例
   int32 port = 4;               // 本实例 host 端口
   repeated string gpu_devices = 5;    // 本实例 GPU 设备 ID，如 ["0"]

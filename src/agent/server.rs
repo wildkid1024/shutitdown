@@ -328,7 +328,7 @@ impl NodeAgentService {
         }
     }
 
-    /// 按模型名判断分类 (chat/embedding/rerank/speech)
+    /// 按模型名判断分类 (chat/embedding/rerank/speech/image)
     fn classify_model_name(name: &str) -> &'static str {
         let n = name.to_lowercase();
         if n.contains("rerank") || n.contains("reranker") {
@@ -342,6 +342,11 @@ impl NodeAgentService {
         if n.contains("whisper") || n.contains("asr") || n.contains("tts")
             || n.contains("cosyvoice") || n.contains("voice") || n.contains("funasr") {
             return "speech";
+        }
+        if n.contains("ocr") || n.contains("ppocr") || n.contains("mineru")
+            || n.contains("vision") || n.contains("image") || n.contains("detection")
+            || n.contains("paddleocr") || n.contains("docaudit") {
+            return "image";
         }
         "chat"
     }
@@ -486,7 +491,7 @@ impl NodeAgentService {
         }
 
         // 排序: 分类固定顺序
-        let order = ["chat", "embedding", "rerank", "speech"];
+        let order = ["chat", "embedding", "rerank", "speech", "image"];
         models.sort_by_key(|m| {
             order.iter().position(|c| *c == m.category).unwrap_or(99)
         });
