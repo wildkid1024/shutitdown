@@ -351,6 +351,22 @@ impl NodeAgentService {
         "chat"
     }
 
+    /// 当探测不到推理 API 时，根据镜像名判断是否属于非 OpenAI 兼容的模型服务 (如 OCR/视觉/语音框架)
+    /// 返回分类；非模型服务返回 None
+    fn classify_model_image_fallback(image: &str) -> Option<&'static str> {
+        let img = image.to_lowercase();
+        if img.contains("ocr") || img.contains("ppocr") || img.contains("paddleocr")
+            || img.contains("mineru") || img.contains("paddle") || img.contains("docaudit") {
+            return Some("image");
+        }
+        if img.contains("whisper") || img.contains("asr") || img.contains("funasr")
+            || img.contains("sherpa") || img.contains("tts") || img.contains("cosyvoice")
+            || img.contains("voice") {
+            return Some("speech");
+        }
+        None
+    }
+
     /// 探测容器端口是否为推理服务，返回 (是否模型服务, 模型名列表)
     /// 只有能成功访问推理框架 API 并解析出模型列表的才算模型服务
     fn probe_model_names(host_port: u64) -> (bool, Vec<String>) {
@@ -447,12 +463,46 @@ impl NodeAgentService {
 
             // 核心判定：能否访问推理框架 URL
             let (is_model, names) = Self::probe_model_names(host_port);
-            if !is_model {
-                continue; // 不是推理服务，排除
-            }
 
             let device = Self::container_device(c);
             let endpoint = format!("127.0.0.1:{}", host_port);
+
+            // 模型名 + 分类：
+            // 1) 能探测到推理 API -> 用探测到的模型名 + 按模型名分类
+            // 2) 探测不到，但镜像属于非 OpenAI 兼容服务 (OCR/视觉/语音) -> 用容器名兜底 + 按镜像分类
+            let fallback_category = Self::classify_model_image_fallback(&image);
+            if !is_model {
+                match fallback_category {
+                    Some(cat) if cat == "image" || cat == "speech" => {
+                        // 收录一个实例 (模型名 = 容器名)
+                        if let Some(m) = models.iter_mut().find(|m| m.category == cat && m.name == cname) {
+                            m.instances.push(ModelInstance {
+                                container_id: cid.clone(),
+                                name: cname.clone(),
+                                image: image.clone(),
+                                status: "running".into(),
+                                endpoint: endpoint.clone(),
+                                device: device.clone(),
+                            });
+                        } else {
+                            models.push(ModelInfo {
+                                category: cat.into(),
+                                name: cname.clone(),
+                                instances: vec![ModelInstance {
+                                    container_id: cid.clone(),
+                                    name: cname.clone(),
+                                    image: image.clone(),
+                                    status: "running".into(),
+                                    endpoint: endpoint.clone(),
+                                    device: device.clone(),
+                                }],
+                            });
+                        }
+                    }
+                    _ => continue, // 不是模型服务，排除
+                }
+                continue;
+            }
 
             // 探测出的模型名，若为空则用容器名兜底
             let model_names: Vec<String> = if names.is_empty() {
