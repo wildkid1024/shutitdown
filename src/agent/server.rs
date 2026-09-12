@@ -506,6 +506,106 @@ impl NodeAgentService {
         dev
     }
 
+    /// 部署根目录 (在节点上保存 compose 文件)
+    const DEPLOY_DIR: &'static str = "/srv/model-deploy";
+
+    /// compose 项目名 ($name 需符合 docker compose 命名规范)
+    fn compose_project(name: &str) -> String {
+        let sanitized: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        let s = sanitized.to_lowercase();
+        let s = s.trim_start_matches(|c| c == '_' || c == '-').to_string();
+        if s.is_empty() { "model".into() } else { s }
+    }
+
+    /// 实例对应的独立 compose 项目名 (如 base-1, base-2)
+    fn instance_project(base: &str, index: i32) -> String {
+        if index > 0 {
+            format!("{}-{}", base, index)
+        } else {
+            base.to_string()
+        }
+    }
+
+    /// 将 env 的 key=value 拼接为 sh 前缀 (用于 docker compose 环境变量注入)
+    fn env_prefix(spec: &ModelDeploySpec, base: &str, index: i32) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        // 端口注入
+        let port = if spec.port > 0 { spec.port } else { 8000 };
+        parts.push(format!("PORT={}", port));
+        // GPU 注入 (NVIDIA_VISIBLE_DEVICES)
+        if !spec.gpu_devices.is_empty() {
+            let ids = spec.gpu_devices.iter().map(|d| d.trim()).collect::<Vec<_>>().join(",");
+            parts.push(format!("NVIDIA_VISIBLE_DEVICES={}", ids));
+        }
+        // 用户额外 env
+        for (k, v) in &spec.env {
+            parts.push(format!("{}={}", k, v.replace(' ', "\\ ")));
+        }
+        // 附加 基础名/实例序号 供 compose 内引用
+        parts.push(format!("MODEL_BASE={}", base));
+        parts.push(format!("MODEL_INDEX={}", index));
+        parts.join(" ")
+    }
+
+    /// 写入并启动 compose 堆栈 (外部 compose 文件 + 每实例独立项目)
+    fn deploy_compose(spec: &ModelDeploySpec) -> Result<String, String> {
+        // 基础目录放共享 compose 文件
+        let base = Self::compose_project(&spec.name);
+        let dir = format!("{}/{}", Self::DEPLOY_DIR, base);
+        if spec.compose_yaml.trim().is_empty() {
+            return Err("外部 compose 文件内容为空".into());
+        }
+        fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {}", e))?;
+        // 写入用户提供的 compose 文件 (模板, 含 ${PORT} 等占位)
+        fs::write(format!("{}/docker-compose.yml", dir), &spec.compose_yaml)
+            .map_err(|e| format!("写入 compose 文件失败: {}", e))?;
+
+        let project = Self::instance_project(&base, spec.index);
+        // 注入 PORT / NVIDIA_VISIBLE_DEVICES / 自定义 env
+        let env_prefix = Self::env_prefix(spec, &base, spec.index);
+        let cmd = format!(
+            "cd '{}' && {} docker compose -p '{}' up -d 2>&1",
+            dir.replace('\'', "'\\''"),
+            env_prefix,
+            project
+        );
+        match Self::run_command(&cmd) {
+            Ok((code, ref out, _)) => {
+                if code == 0 {
+                    Ok(format!("{}", out))
+                } else {
+                    Err(format!("{}", out))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 停止并移除指定实例的 compose 项目
+    fn undeploy_compose(spec: &ModelDeploySpec) -> Result<String, String> {
+        let base = Self::compose_project(&spec.name);
+        let dir = format!("{}/{}", Self::DEPLOY_DIR, base);
+        let project = Self::instance_project(&base, spec.index);
+        let cmd = format!(
+            "cd '{}' && docker compose -p '{}' down 2>&1",
+            dir.replace('\'', "'\\''"),
+            project
+        );
+        match Self::run_command(&cmd) {
+            Ok((code, ref out, _)) => {
+                if code == 0 {
+                    Ok(format!("{}", out))
+                } else {
+                    Err(format!("{}", out))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// 格式化 Docker 端口映射
     fn format_docker_ports(ports: Option<&Vec<serde_json::Value>>) -> String {
         let ports = match ports {
@@ -1051,6 +1151,60 @@ impl NodeAgent for NodeAgentService {
                 success: false,
                 logs: String::new(),
                 message: e,
+            })),
+        }
+    }
+
+    async fn deploy_model(
+        &self,
+        request: Request<ModelDeploySpec>,
+    ) -> Result<Response<ModelDeployResponse>, Status> {
+        let spec = request.into_inner();
+        if spec.name.is_empty() {
+            return Ok(Response::new(ModelDeployResponse {
+                success: false,
+                message: "模型名不能为空".into(),
+                container_id: String::new(),
+            }));
+        }
+        // 部署实例 (外部 compose + 每实例独立项目)
+        match Self::deploy_compose(&spec) {
+            Ok(_) => Ok(Response::new(ModelDeployResponse {
+                success: true,
+                message: format!("模型 {} 实例 {} 部署成功 (compose), 端口 {}",
+                    spec.name, spec.index, if spec.port > 0 { spec.port } else { 8000 }),
+                container_id: String::new(),
+            })),
+            Err(e) => Ok(Response::new(ModelDeployResponse {
+                success: false,
+                message: format!("部署失败: {}", e),
+                container_id: String::new(),
+            })),
+        }
+    }
+
+    async fn undeploy_model(
+        &self,
+        request: Request<ModelDeploySpec>,
+    ) -> Result<Response<ModelDeployResponse>, Status> {
+        let spec = request.into_inner();
+        if spec.name.is_empty() {
+            return Ok(Response::new(ModelDeployResponse {
+                success: false,
+                message: "模型名为空".into(),
+                container_id: String::new(),
+            }));
+        }
+        match Self::undeploy_compose(&spec) {
+            Ok(_) => Ok(Response::new(ModelDeployResponse {
+                success: true,
+                message: format!("模型 {} 实例 {} 已停止并移除 (compose)", spec.name, spec.index),
+                container_id: String::new(),
+            })),
+            Err(e) => Ok(Response::new(ModelDeployResponse {
+                success: false,
+                message: format!("操作失败: {}", e),
+                container_id: String::new(),
             })),
         }
     }

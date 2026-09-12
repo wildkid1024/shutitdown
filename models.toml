@@ -1,0 +1,12 @@
+# 模型部署配置 (node-agent deploy / undeploy)
+# 本次只部署: DCU OCR 服务 到 192.168.100.67
+
+[[targets]]
+ip = "192.168.100.67"
+port = 50051
+name = "算力节点-03"
+
+[[targets.models]]
+name = "ocr"
+category = "speech"
+compose_file = "compose/ocr.yml"

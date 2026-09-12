@@ -175,6 +175,28 @@ impl AgentClient {
         Ok((inner.success, inner.logs, inner.message))
     }
 
+    /// 部署模型服务
+    pub async fn deploy_model(&self, spec: ModelDeploySpec) -> Result<(bool, String, String), String> {
+        let mut client = self.client().map_err(|e| format!("连接失败: {}", e))?;
+        let resp = client
+            .deploy_model(spec)
+            .await
+            .map_err(|e| format!("部署失败: {}", e))?;
+        let inner = resp.into_inner();
+        Ok((inner.success, inner.message, inner.container_id))
+    }
+
+    /// 停止/移除模型服务
+    pub async fn undeploy_model(&self, spec: ModelDeploySpec) -> Result<(bool, String), String> {
+        let mut client = self.client().map_err(|e| format!("连接失败: {}", e))?;
+        let resp = client
+            .undeploy_model(spec)
+            .await
+            .map_err(|e| format!("停止失败: {}", e))?;
+        let inner = resp.into_inner();
+        Ok((inner.success, inner.message))
+    }
+
     /// 连接并采集完整信息（一个连接完成 ping + get_node_info）
     pub async fn connect_and_collect(&self) -> Result<AgentConnection, String> {
         self.ping().await

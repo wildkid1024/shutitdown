@@ -1,0 +1,36 @@
+services:
+  ocr_svc:
+    image: local.io/dcu/ocr:v1.0.2
+    container_name: models-ocr-svc
+    devices:
+      - /dev/kfd
+      - /dev/dri/card4
+      - /dev/dri/renderD131
+      - /dev/mkfd
+    cap_add:
+      - SYS_PTRACE
+    group_add:
+      - video
+      - '39'
+    shm_size: 16G
+    privileged: true
+    security_opt:
+      - seccomp=unconfined
+    restart: always
+    working_dir: /ocr_app
+    command: python app.py
+    ports:
+      - "9986:9986"
+    environment:
+      - CRYPTOGRAPHY_OPENSSL_NO_LEGACY=1
+      - FLAGS_conv_workspace_size_limit=0
+    volumes:
+      - /opt/hyhal:/opt/hyhal
+      - /mnt/models:/data/model
+    networks:
+      - deepchat
+networks:
+    deepchat:
+      # external: true
+      driver: bridge
+      name: deepchat
