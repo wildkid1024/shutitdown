@@ -74,6 +74,7 @@ node-agent dashboard   # 读取 agent.toml，gRPC 采集并实时刷新
 | `↑` / `↓` / `j` / `k` | 移动行选择 |
 | `Enter` / `Space` | 折叠/展开节点、堆栈或模型 |
 | `l` | 查看容器日志（容器/堆栈/模型标签页，弹窗可滚动） |
+| `PgUp` / `PgDn`（或 `b` / `f`） | 日志弹窗内整页滚动 |
 | `v` | 模型实例连通性 / 速度测试（模型标签页） |
 | `c` / `d` | 启动 / 停止 Compose 堆栈（堆栈标签页） |
 | `s` / `t` | 启动 / 停止容器（容器/堆栈标签页） |
@@ -98,7 +99,31 @@ category = "image"
 compose_file = "compose/ocr.yml"   # 外部 compose 模板，运行时会推送到远端
 ```
 
-`node-agent` 会把外部 compose 模板写入被控节点的 `/srv/model-deploy/<name>/`，注入 `PORT`、`NVIDIA_VISIBLE_DEVICES` 及自定义环境变量后启动，每个实例使用独立 compose 项目。可配合仓库内 `compose/qwen2.5-7b.yml`、`compose/bge-m3.yml`、`compose/ocr.yml` 等模板使用。
+`node-agent` 会把外部 compose 模板写入被控节点的 `/srv/model-deploy/<name>/`，注入 `PORT`、`NVIDIA_VISIBLE_DEVICES` 及自定义环境变量后启动，每个实例使用独立 compose 项目（项目名 `<name>-<序号>`）。可配合仓库内 `compose/ocr.yml` 模板使用。
+
+除简单多副本外，还可以用 `instances` 表对每个实例单独指定端口、GPU 设备与环境变量：
+
+```toml
+[[targets.models]]
+name = "ocr"
+category = "image"
+compose_file = "compose/ocr.yml"
+
+# 实例 1：端口 8001，GPU 0
+[[targets.models.instances]]
+port = 8001
+gpu_devices = ["0"]
+
+# 实例 2：端口 8002，GPU 1，附加环境变量
+[[targets.models.instances]]
+port = 8002
+gpu_devices = ["1"]
+
+[targets.models.instances.env]
+OMP_NUM_THREADS = "4"
+```
+
+> 未配置 `instances` 时按单实例部署（端口由 compose 模板或服务端动态分配）。
 
 ---
 
@@ -158,6 +183,28 @@ docker run -it --rm \
   -v $PWD/config.toml:/data/config.toml \
   -v ~/.ssh:/root/.ssh \
   shutitdown node_info          # 或 batch_shutdown
+```
+
+### RPM 打包与 systemd 部署
+
+使用 `fpm` 将二进制打包为 RPM（自动安装 systemd 服务单元与配置文件）：
+
+```bash
+./package-rpm.sh amd64 0.1.0     # x86_64；aarch64 亦支持
+# 产物输出到 dist/batch-shutdown-0.1.0-*.rpm
+```
+
+RPM 内容：
+
+- 二进制安装到 `/usr/local/bin/`（`node-agent` 必须存在，`node_info` / `batch_shutdown` 缺失时自动跳过）
+- 配置文件安装到 `/etc/batch-shutdown/`（`agent.toml`、`config.toml`，标记为 config 文件，升级不覆盖）
+- systemd 服务单元 `node-agent.service`，卸载时自动停止并禁用服务
+
+被控节点安装 RPM 后，通过 systemd 常驻运行 Agent 服务端：
+
+```bash
+sudo rpm -ivh dist/batch-shutdown-*.rpm
+sudo systemctl enable --now node-agent
 ```
 
 ---

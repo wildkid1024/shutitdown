@@ -42,7 +42,7 @@ struct DeployModel {
     /// 外部 docker-compose 文件路径 (本地，会推送到远端)
     #[serde(default)]
     compose_file: String,
-    /// 实例数 (可配合 instances 表逐实例配置；缺省用此整数)
+    /// 实例列表（每个实例可单独配置 port / gpu_devices / env；留空则按单实例部署）
     #[serde(default)]
     instances: Vec<DeployInstance>,
 }

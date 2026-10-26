@@ -16,6 +16,15 @@ use dirs::home_dir;
 struct Machine {
     ip: String,
     user: String,
+    name: Option<String>,
+    tag: Option<String>,
+}
+
+impl Machine {
+    /// 展示名称：优先 name，缺省用 ip
+    fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.ip)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,7 +184,10 @@ fn main() {
     // 多选机器
     let items: Vec<String> = cfg.machines
         .iter()
-        .map(|m| format!("{} | user:{}", m.ip, m.user))
+        .map(|m| match &m.tag {
+            Some(tag) => format!("{} ({}) | ip:{} | user:{}", m.display_name(), tag, m.ip, m.user),
+            None => format!("{} | ip:{} | user:{}", m.display_name(), m.ip, m.user),
+        })
         .collect();
 
     // 修复：defaults 需要bool数组，实现【默认全部勾选】
@@ -202,7 +214,7 @@ fn main() {
     println!("\n即将执行关机的机器：");
     let mut select_log = String::from("选中关机机器列表：");
     for m in &selected_machines {
-        println!(" - {}", m.ip);
+        println!(" - {} ({})", m.display_name(), m.ip);
         select_log.push_str(&format!(" {} ", m.ip));
     }
     write_log(&select_log);
